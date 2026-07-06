@@ -1,7 +1,7 @@
 """Rich terminal dashboard — clean, scannable, no emojis (Windows console)."""
 from __future__ import annotations
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
@@ -18,7 +18,9 @@ def _fmt(v, spec=".2f", dash="-"):
 def render(run_date: str, data_date: str, tickers_scanned: int, llm_status: str,
            exits: list[dict], active_picks: list[dict], new_picks: list[dict],
            holdings: list[dict], stats: dict, warnings: list[str],
-           discord_status: str) -> None:
+           discord_status: str, paper_entries: list[dict] | None = None,
+           paper_exits: list[dict] | None = None, paper_book: dict | None = None,
+           holdings_provenance: dict | None = None) -> None:
     console.print()
     console.print(Panel(
         f"[bold cyan]STOCKBOT[/] - NSE Short-Term Daily Report\n"
@@ -71,7 +73,7 @@ def render(run_date: str, data_date: str, tickers_scanned: int, llm_status: str,
     if new_picks:
         for p in new_picks:
             ch = p.get("channel", "TECHNICAL")
-            ch_style = "yellow" if ch == "NEWS" else "cyan"
+            ch_style = {"NEWS": "yellow", "PULLBACK": "magenta"}.get(ch, "cyan")
             t.add_row(
                 p["ticker"], f"[{ch_style}]{ch}[/]",
                 _fmt(p["entry_price"]), _fmt(p["target_price"]),
@@ -98,17 +100,75 @@ def render(run_date: str, data_date: str, tickers_scanned: int, llm_status: str,
             h["ticker"], _fmt(h["avg_buy"]), str(h["qty"]), _fmt(h.get("ltp")),
             f"[{pnl_style}]{pnl_txt}[/]", f"[{style}]{h['signal']}[/]",
         )
-    console.print(Panel(t, title="[bold magenta]4. MY HOLDINGS - HEALTH CHECK[/]",
+    prov = holdings_provenance or {}
+    prov_txt = (f" (source: {prov['source']}, synced {prov['synced_at'][:16]})"
+                if prov.get("source") and prov.get("synced_at")
+                else f" (source: {prov['source']})" if prov.get("source") else "")
+    console.print(Panel(t, title=f"[bold magenta]4. MY HOLDINGS - HEALTH CHECK{prov_txt}[/]",
                         border_style="magenta"))
 
-    # 5. SUMMARY -----------------------------------------------------------
+    # 5. PAPER BOOK --------------------------------------------------------
+    if paper_book is not None:
+        header = (
+            f"Equity: [bold]INR {paper_book['equity']:,.0f}[/] "
+            f"({paper_book['total_return_pct']:+.2f}% on {paper_book['starting_cash']:,.0f})   "
+            f"Cash: [bold]{paper_book['cash']:,.0f}[/]   "
+            f"Unrealized: {paper_book['unrealized_pnl']:+,.0f}   "
+            f"Realized (cum): {paper_book['realized_pnl_cum']:+,.0f}"
+        )
+        strat_bits = []
+        for name, st in paper_book.get("strategy_stats", {}).items():
+            if st["closed"]:
+                strat_bits.append(f"{name}: {st['closed']} closed / "
+                                  f"{st['win_rate']:.0f}% wins / {st['realized_pnl']:+,.0f}")
+        if strat_bits:
+            header += "\n" + "   ".join(strat_bits)
+
+        t = Table(box=box.SIMPLE_HEAVY, expand=True)
+        for col in ("Ticker", "Strat", "Qty", "Entry Fill", "LTP", "Value",
+                    "Unrl P&L", "Target", "Stop"):
+            t.add_column(col, overflow="fold")
+        if paper_book["open_positions"]:
+            for p in paper_book["open_positions"]:
+                pnl_style = "green" if p["unrealized_pnl"] >= 0 else "red"
+                t.add_row(
+                    p["ticker"], p["strategy"], str(p["qty"]),
+                    _fmt(p["entry_fill_price"]), _fmt(p["ltp"]), _fmt(p["value"], ",.0f"),
+                    f"[{pnl_style}]{p['unrealized_pnl']:+,.0f}[/]",
+                    _fmt(p["target_price"]), _fmt(p["stop_price"]),
+                )
+        else:
+            t.add_row("-", "-", "-", "-", "-", "-", "-", "-", "No open paper positions")
+
+        action_lines = []
+        for a in (paper_entries or []):
+            if a["action"] == "BUY":
+                action_lines.append(
+                    f"[green]BUY[/] {a['ticker']} [{a['strategy']}] {a['qty']} sh @ "
+                    f"{a['fill_price']:.2f} = {a['invested']:,.0f} "
+                    f"(tgt {a['target_price']:.2f} / stop {a['stop_price']:.2f})")
+            else:
+                action_lines.append(f"[yellow]SKIP[/] {a['ticker']} [{a['strategy']}] {a['note']}")
+        for a in (paper_exits or []):
+            pnl_style = "green" if a["realized_pnl"] >= 0 else "red"
+            action_lines.append(
+                f"[{pnl_style}]SELL[/] {a['ticker']} [{a['strategy']}] {a['qty']} sh @ "
+                f"{a['fill_price']:.2f} -> {a['net_proceeds']:,.0f} net "
+                f"([{pnl_style}]{a['realized_pnl']:+,.0f} / {a['realized_pct']:+.2f}%[/]) "
+                f"{a['status']}")
+        body = header + "\n" + ("\n".join(action_lines) + "\n" if action_lines else "")
+        console.print(Panel(Group(body, t),
+                            title="[bold cyan]5. PAPER BOOK (virtual, shared across strategies)[/]",
+                            border_style="cyan"))
+
+    # 6. SUMMARY -----------------------------------------------------------
     summary = (
         f"Closed picks (all time): [bold]{stats['closed']}[/]   "
         f"Win rate: [bold]{stats['win_rate']:.0f}%[/]   "
         f"Avg win: [green]{stats['avg_win']:+.2f}%[/]   "
         f"Avg loss: [red]{stats['avg_loss']:+.2f}%[/]"
     )
-    console.print(Panel(summary, title="[bold]5. SUMMARY[/]", border_style="white"))
+    console.print(Panel(summary, title="[bold]6. SUMMARY[/]", border_style="white"))
 
     if warnings:
         console.print(Panel("\n".join(f"- {w}" for w in warnings),

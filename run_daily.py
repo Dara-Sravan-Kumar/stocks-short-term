@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 
 import config
 from stockbot import db, market_data, news, sentiment, signals, exits, portfolio
-from stockbot import dashboard, discord_alerts
+from stockbot import dashboard, discord_alerts, paper, broker
 from stockbot.indicators import compute_snapshot
 
 
@@ -45,9 +45,14 @@ def main() -> int:
     warnings: list[str] = []
 
     conn = db.connect()
-    if db.seed_mock_holdings(conn):
-        warnings.append("Holdings table was empty - seeded mock holdings "
-                        "(RELIANCE.NS, TCS.NS, INFY.NS)")
+    if db.ensure_paper_book(conn):
+        warnings.append(f"Paper book created with Rs {config.PAPER_STARTING_CASH:,.0f} "
+                        "virtual cash")
+    print("Syncing holdings from broker (OpenAlgo)...")
+    holdings_sync = broker.sync_holdings(conn, warnings)
+    print(f"Holdings: {holdings_sync['count']} positions "
+          f"(source: {holdings_sync['source']}"
+          f"{', STALE' if holdings_sync['stale'] else ''})")
 
     # -------------------------------------------------------------- universe
     from stockbot import universe as universe_mod
@@ -90,11 +95,12 @@ def main() -> int:
     headlines = news.fetch_headlines_bulk(news_universe, warnings)
 
     # Score sentiment for: tickers with fresh headlines (news channel),
-    # plus technical-screen survivors, active picks, and holdings.
-    from stockbot.signals import _passes_technicals  # internal reuse
+    # plus technical/pullback-screen survivors, active picks, and holdings.
+    from stockbot.signals import _passes_technicals, _passes_pullback  # internal reuse
     screen_survivors = [
         t for t in config.WATCHLIST
-        if t in snapshots and t not in active and _passes_technicals(snapshots[t])
+        if t in snapshots and t not in active
+        and (_passes_technicals(snapshots[t]) or _passes_pullback(snapshots[t]))
     ]
     with_news = [t for t, hl in headlines.items() if hl]
     sentiment_universe = sorted(set(with_news) | set(screen_survivors)
@@ -120,15 +126,28 @@ def main() -> int:
     print("Evaluating active picks for exit signals...")
     closed = exits.evaluate_active_picks(conn, snapshots, histories, sentiments,
                                          run_date, warnings)
+    # paper exits BEFORE new entries so freed cash is available for sizing
+    paper_exits = paper.close_positions_for_exits(conn, closed, run_date,
+                                                  run_slot, warnings)
 
     # ------------------------------------------------------------- new picks
-    # Channel B first (news is the primary channel), then Channel A.
+    # Channel B first (news is the primary channel), then A, then C (pullback).
     print("Scanning for news-catalyst picks (Channel B)...")
     news_picks = signals.scan_news_picks(conn, snapshots, sentiments, run_date, warnings)
     print("Scanning for technical picks (Channel A)...")
     tech_picks = signals.scan_new_picks(conn, snapshots, sentiments, run_date,
                                         warnings, args.top)
-    new_picks = news_picks + tech_picks
+    print("Scanning for pullback picks (Channel C)...")
+    pullback_picks = signals.scan_pullback_picks(conn, snapshots, sentiments,
+                                                 run_date, warnings)
+    new_picks = news_picks + tech_picks + pullback_picks
+    paper_entries = paper.open_positions_for_picks(conn, new_picks, snapshots,
+                                                   run_date, run_slot, warnings)
+    # mirror paper orders into OpenAlgo's sandbox UI (SELLs first, then BUYs;
+    # hard-gated on analyzer mode so nothing can reach the real broker)
+    mirrored = broker.mirror_paper_orders(paper_exits + paper_entries, warnings)
+    if mirrored:
+        print(f"Mirrored {mirrored} paper order(s) to OpenAlgo sandbox")
 
     # -------------------------------------------------------- active overview
     active_rows = []
@@ -146,6 +165,8 @@ def main() -> int:
     print("Running holdings health check...")
     holdings_report = portfolio.health_check(conn, snapshots, sentiments, warnings)
     stats = db.get_closed_picks_stats(conn)
+    paper_book = paper.mark_to_market(conn, snapshots, run_date, run_slot)
+    holdings_provenance = db.get_holdings_provenance(conn)
 
     # ------------------------------------------------- tracking history log
     # Store per-run snapshots: price, return %, sentiment, and news catalyst
@@ -174,14 +195,34 @@ def main() -> int:
             h.get("ltp"), h.get("pnl_pct"), sent_info.get("score"),
             sent_info.get("summary"), h["signal"],
         )
+    for pp in paper_book["open_positions"]:
+        sent_info = sentiments.get(pp["ticker"]) or {}
+        ret = round((pp["ltp"] - pp["entry_fill_price"])
+                    / pp["entry_fill_price"] * 100, 2)
+        db.upsert_tracking(
+            conn, run_date, run_slot, "PAPER", pp["ticker"], pp["strategy"],
+            pp["ltp"], ret, sent_info.get("score"), sent_info.get("summary"),
+            f"{pp['qty']} sh @ {pp['entry_fill_price']:.2f} since {pp['entry_date']}; "
+            f"unrl Rs {pp['unrealized_pnl']:+,.0f}",
+        )
 
     # --------------------------------------------------------------- discord
     if args.no_discord:
         discord_status = "skipped (--no-discord)"
     else:
         print("Sending Discord alerts...")
+        if holdings_sync["source"] == "OPENALGO":
+            holdings_note = f"live sync {holdings_sync['synced_at'][:16]}"
+        elif holdings_sync["stale"]:
+            holdings_note = "STALE SNAPSHOT - refresh IndMoney token"
+        elif holdings_sync["source"] == "MOCK":
+            holdings_note = "mock data"
+        else:
+            holdings_note = f"cached {holdings_sync['synced_at'] or 'never'}"
         discord_status = discord_alerts.send_report(
-            run_date, closed, new_picks, active_rows, holdings_report, stats, warnings)
+            run_date, closed, new_picks, active_rows, holdings_report, stats, warnings,
+            paper_entries=paper_entries, paper_exits=paper_exits, paper_book=paper_book,
+            holdings_note=holdings_note)
 
     # -------------------------------------------------------------- dashboard
     dashboard.render(
@@ -189,6 +230,8 @@ def main() -> int:
         llm_status=llm_status, exits=closed, active_picks=active_rows,
         new_picks=new_picks, holdings=holdings_report, stats=stats,
         warnings=warnings, discord_status=discord_status,
+        paper_entries=paper_entries, paper_exits=paper_exits, paper_book=paper_book,
+        holdings_provenance=holdings_provenance,
     )
 
     db.log_run(conn, run_date, started_at, datetime.now().isoformat(timespec="seconds"),

@@ -89,7 +89,8 @@ def build_picks_embeds(run_date: str, exits: list[dict], new_picks: list[dict],
         fields = []
         for p in new_picks:
             channel = p.get("channel", "TECHNICAL")
-            icon = ":newspaper:" if channel == "NEWS" else ":chart_with_upwards_trend:"
+            icon = {"NEWS": ":newspaper:", "PULLBACK": ":arrow_heading_down:"}.get(
+                channel, ":chart_with_upwards_trend:")
             fields.append({
                 "name": f"{icon} {p['ticker']}  [{channel}]",
                 "value": _clip(
@@ -136,7 +137,8 @@ def build_picks_embeds(run_date: str, exits: list[dict], new_picks: list[dict],
     return embeds
 
 
-def build_holdings_embeds(run_date: str, holdings: list[dict], stats: dict) -> list[dict]:
+def build_holdings_embeds(run_date: str, holdings: list[dict], stats: dict,
+                          holdings_note: str | None = None) -> list[dict]:
     fields = []
     for h in holdings:
         pnl = h.get("pnl_pct")
@@ -156,18 +158,103 @@ def build_holdings_embeds(run_date: str, holdings: list[dict], stats: dict) -> l
         f"Closed picks: {stats['closed']}  |  Win rate: {stats['win_rate']:.0f}%  |  "
         f"Avg win: {stats['avg_win']:+.2f}%  |  Avg loss: {stats['avg_loss']:+.2f}%"
     )
+    title = f":briefcase: MY HOLDINGS - Health Check ({run_date})"
+    if holdings_note:
+        title += f"  [{holdings_note}]"
     return [{
-        "title": f":briefcase: MY HOLDINGS - Health Check ({run_date})",
+        "title": title,
         "color": PURPLE,
         "fields": fields[:25],
         "footer": {"text": summary},
     }]
 
 
+def build_paper_embeds(run_date: str, paper_entries: list[dict],
+                       paper_exits: list[dict], paper_book: dict) -> list[dict]:
+    """Every paper action gets an alert — the user mirrors trades manually."""
+    embeds: list[dict] = []
+
+    buys = [a for a in paper_entries if a["action"] == "BUY"]
+    skips = [a for a in paper_entries if a["action"] == "SKIP"]
+    if buys:
+        fields = []
+        for a in buys:
+            rr = a.get("reward_risk")
+            rr_txt = f"{rr:.1f}" if isinstance(rr, (int, float)) else "-"
+            fields.append({
+                "name": f":money_with_wings: BUY {a['ticker']}  [{a['strategy']}]",
+                "value": _clip(
+                    f"**{a['qty']} shares @ {a['fill_price']:.2f}** = "
+                    f"₹{a['invested']:,.0f} (incl. ₹{a['charges']:.0f} charges)\n"
+                    f"Target: **{a['target_price']:.2f}**  |  "
+                    f"Stop: **{a['stop_price']:.2f}**  |  R:R {rr_txt}\n"
+                    f"Cash left: ₹{a['cash_after']:,.0f}  |  {a.get('note', '')}\n"
+                    f"_{a.get('rationale', '')}_"
+                ),
+                "inline": False,
+            })
+        embeds.append({
+            "title": f":page_facing_up: PAPER BUYS - {run_date} (mirror manually if convinced)",
+            "color": GREEN,
+            "fields": fields[:25],
+        })
+    if paper_exits:
+        fields = []
+        for a in paper_exits:
+            pnl = a["realized_pnl"]
+            arrow = ":chart_with_upwards_trend:" if pnl >= 0 else ":chart_with_downwards_trend:"
+            fields.append({
+                "name": f"{arrow} SELL {a['ticker']}  [{a['strategy']}]  [{a['status']}]",
+                "value": _clip(
+                    f"**{a['qty']} shares @ {a['fill_price']:.2f}** -> "
+                    f"₹{a['net_proceeds']:,.0f} net (₹{a['charges']:.0f} charges)\n"
+                    f"Realized P&L: **₹{pnl:+,.0f} ({a['realized_pct']:+.2f}%)**  |  "
+                    f"held since {a['entry_date']}\n"
+                    f"_{a['exit_reason']}_"
+                ),
+                "inline": False,
+            })
+        embeds.append({
+            "title": f":outbox_tray: PAPER SELLS - {run_date}",
+            "color": GREEN if all(a["realized_pnl"] >= 0 for a in paper_exits) else RED,
+            "fields": fields[:25],
+        })
+
+    strat = paper_book.get("strategy_stats", {})
+    strat_lines = [
+        f"{name}: {st['closed']} closed, {st['win_rate']:.0f}% wins, "
+        f"₹{st['realized_pnl']:+,.0f}"
+        for name, st in strat.items() if st["closed"]
+    ]
+    desc = (
+        f"Equity: **₹{paper_book['equity']:,.0f}** "
+        f"({paper_book['total_return_pct']:+.2f}% on ₹{paper_book['starting_cash']:,.0f})\n"
+        f"Cash: ₹{paper_book['cash']:,.0f}  |  "
+        f"Positions: ₹{paper_book['positions_value']:,.0f} "
+        f"({len(paper_book['open_positions'])} open)\n"
+        f"Unrealized: ₹{paper_book['unrealized_pnl']:+,.0f}  |  "
+        f"Realized (cum): ₹{paper_book['realized_pnl_cum']:+,.0f}"
+    )
+    if strat_lines:
+        desc += "\n" + " | ".join(strat_lines)
+    if skips:
+        desc += "\n" + "\n".join(
+            f":no_entry_sign: {a['ticker']} [{a['strategy']}] {a['note']}" for a in skips)
+    embeds.append({
+        "title": f":ledger: PAPER BOOK - {run_date}",
+        "description": _clip(desc, 4000),
+        "color": PURPLE,
+    })
+    return embeds
+
+
 def send_report(run_date: str, exits: list[dict], new_picks: list[dict],
                 active_picks: list[dict], holdings: list[dict], stats: dict,
-                warnings: list[str]) -> str:
-    """Send picks + holdings as separate Discord messages. Returns status text."""
+                warnings: list[str], paper_entries: list[dict] | None = None,
+                paper_exits: list[dict] | None = None,
+                paper_book: dict | None = None,
+                holdings_note: str | None = None) -> str:
+    """Send picks + holdings (+ paper book) Discord messages. Returns status text."""
     cfg = config.discord_settings()
     if not cfg["token"] or not cfg["picks_channel"]:
         warnings.append("Discord not configured (set DISCORD_BOT_TOKEN and "
@@ -176,12 +263,19 @@ def send_report(run_date: str, exits: list[dict], new_picks: list[dict],
 
     picks_channel = cfg["picks_channel"]
     holdings_channel = cfg["holdings_channel"] or picks_channel
+    paper_channel = cfg["paper_channel"] or picks_channel
 
     ok = True
     for chunk in _chunk_embeds(build_picks_embeds(run_date, exits, new_picks, active_picks)):
         ok &= _post(cfg["token"], picks_channel, {"embeds": chunk}, warnings)
         time.sleep(0.5)
-    for chunk in _chunk_embeds(build_holdings_embeds(run_date, holdings, stats)):
+    for chunk in _chunk_embeds(build_holdings_embeds(run_date, holdings, stats,
+                                                     holdings_note)):
         ok &= _post(cfg["token"], holdings_channel, {"embeds": chunk}, warnings)
         time.sleep(0.5)
+    if paper_book is not None:
+        for chunk in _chunk_embeds(build_paper_embeds(
+                run_date, paper_entries or [], paper_exits or [], paper_book)):
+            ok &= _post(cfg["token"], paper_channel, {"embeds": chunk}, warnings)
+            time.sleep(0.5)
     return "sent" if ok else "partial failure"

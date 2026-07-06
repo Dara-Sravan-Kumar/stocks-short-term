@@ -1,4 +1,4 @@
-"""Daily headline collection: yfinance .news with Google News RSS fallback."""
+"""Daily headline collection: yfinance .news MERGED with Google News India RSS."""
 from __future__ import annotations
 
 import time
@@ -75,11 +75,24 @@ def _from_google_rss(ticker: str) -> list[dict]:
 
 
 def fetch_headlines(ticker: str) -> list[dict]:
-    """Up to MAX_HEADLINES_PER_TICKER recent headlines for a ticker."""
-    items = _from_yfinance(ticker)
-    if not items:
-        items = _from_google_rss(ticker)
-    return items[: config.MAX_HEADLINES_PER_TICKER]
+    """Up to MAX_HEADLINES_PER_TICKER recent headlines for a ticker.
+
+    Yahoo Finance (global wires) and Google News India (domestic press:
+    Moneycontrol, ET, Business Standard, ...) are MERGED — not fallback —
+    so a couple of wire items can't crowd out local catalyst coverage.
+    Deduped on normalized title, newest first.
+    """
+    items = _from_yfinance(ticker) + _from_google_rss(ticker)
+    seen: set[str] = set()
+    unique = []
+    for h in items:
+        key = "".join(ch for ch in h["title"].lower() if ch.isalnum())[:60]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(h)
+    unique.sort(key=lambda h: h["date"], reverse=True)  # undated ("") sort last
+    return unique[: config.MAX_HEADLINES_PER_TICKER]
 
 
 def fetch_headlines_bulk(tickers: list[str], warnings: list[str],

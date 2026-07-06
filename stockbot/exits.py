@@ -52,7 +52,12 @@ def evaluate_active_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapsho
             reason = "Target resistance reached - book profit"
         else:
             sent = (sentiments.get(ticker) or {}).get("score", 0.0) or 0.0
-            if snap.closes_below_sma20 >= config.SETUP_BROKEN_SMA_BARS:
+            # pullback entries sit AT SMA20, so they get more room before the
+            # consecutive-closes-below rule fires
+            sma_bars = (config.PULLBACK_SETUP_BROKEN_SMA_BARS
+                        if pick["channel"] == "PULLBACK"
+                        else config.SETUP_BROKEN_SMA_BARS)
+            if snap.closes_below_sma20 >= sma_bars:
                 status = "SETUP_BROKEN"
                 exit_price = snap.close
                 reason = (f"Setup broken: closed below SMA20 for "

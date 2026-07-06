@@ -203,6 +203,64 @@ SENTIMENT_MODEL = "haiku"      # cheap on subscription quota; e.g. "sonnet"
 CLAUDE_CLI_TIMEOUT = 300       # seconds per batched call
 
 # ---------------------------------------------------------------------------
+# Paper trading — one shared virtual book, positions tagged by strategy
+# ---------------------------------------------------------------------------
+PAPER_STRATEGIES = ["TECHNICAL", "NEWS", "PULLBACK"]
+PAPER_STARTING_CASH = 10_000.0   # INR, single shared cash pool
+PAPER_RISK_PCT_PER_TRADE = 1.5   # % of book equity risked between entry and stop
+PAPER_MAX_POSITION_PCT = 40.0    # max position value as % of book equity
+PAPER_MIN_CASH_BUFFER = 50.0     # cash kept free for charges (INR)
+PAPER_MIN_POSITION_VALUE = 1500.0  # skip positions smaller than this: fixed
+                                   # charges (~Rs 23 round trip) would eat them
+
+# Indian delivery cost model (INDmoney/INDstocks rates). All *_PCT are percent.
+PAPER_SLIPPAGE_PCT = 0.05        # adverse fill assumption, each side
+PAPER_BROKERAGE_PER_ORDER = 5.0  # flat INR per executed order
+PAPER_STT_PCT = 0.10             # securities transaction tax, each side
+PAPER_EXCH_TXN_PCT = 0.00297     # NSE transaction charge
+PAPER_SEBI_PCT = 0.0001          # SEBI turnover fee
+PAPER_STAMP_PCT_BUY = 0.015      # stamp duty, buy side only
+PAPER_GST_PCT = 18.0             # on brokerage + exchange + SEBI (+ DP on sell)
+PAPER_DP_CHARGE_SELL = 16.0      # depository charge per scrip per sell day, INR
+
+# ---------------------------------------------------------------------------
+# Pullback channel (Channel C): buy-the-dip to SMA20 inside an uptrend
+# ---------------------------------------------------------------------------
+PULLBACK_SMA20_TOUCH_PCT = 1.0          # day's low within 1% of SMA20
+PULLBACK_MAX_CLOSE_BELOW_SMA20_PCT = 1.0  # close may sit at most 1% under SMA20
+PULLBACK_RSI_MIN = 35.0
+PULLBACK_RSI_MAX = 55.0                 # below TECHNICAL's 45-68 window
+PULLBACK_MIN_MOM20 = 3.0                # 20d momentum proves uptrend (%)
+PULLBACK_MAX_MOM5 = 0.0                 # 5d momentum <= 0 proves a dip (%)
+PULLBACK_MIN_REWARD_RISK = 1.5
+MAX_PULLBACK_PICKS_PER_DAY = 3
+PULLBACK_SETUP_BROKEN_SMA_BARS = 3      # entry IS at SMA20; default 2 would whipsaw
+
+# ---------------------------------------------------------------------------
+# OpenAlgo broker bridge (holdings sync from INDmoney; creds in .env)
+# ---------------------------------------------------------------------------
+OPENALGO_TIMEOUT = 15            # seconds per REST call
+HOLDINGS_STALE_HOURS = 30        # warn when the last broker sync is older
+BROKER_SYMBOL_OVERRIDES = {}     # OpenAlgo symbol -> yfinance ticker exceptions
+PLACE_ORDER_ENABLED = False      # hard gate: real order placement is OFF in v1
+
+# Mirror paper BUY/SELL orders into OpenAlgo's Analyzer (sandbox) so they show
+# up in its trading UI. Safety: mirroring only happens when OpenAlgo confirms
+# analyzer mode is ON — if the server is in live mode, orders are NOT sent.
+# OFF until the IndMoney broker connect (OpenAlgo's symbol master needs the
+# broker token, so sandbox orders fail without it). Flip to True after.
+PAPER_MIRROR_TO_OPENALGO = False
+
+
+def openalgo_settings() -> dict:
+    """Read OpenAlgo connection settings from the environment (after load_dotenv)."""
+    return {
+        "host": os.getenv("OPENALGO_HOST", "").strip().rstrip("/"),
+        "api_key": os.getenv("OPENALGO_API_KEY", "").strip(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Discord (credentials come from .env / environment)
 # ---------------------------------------------------------------------------
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -214,4 +272,5 @@ def discord_settings() -> dict:
         "token": os.getenv("DISCORD_BOT_TOKEN", "").strip(),
         "picks_channel": os.getenv("DISCORD_PICKS_CHANNEL_ID", "").strip(),
         "holdings_channel": os.getenv("DISCORD_HOLDINGS_CHANNEL_ID", "").strip(),
+        "paper_channel": os.getenv("DISCORD_PAPER_CHANNEL_ID", "").strip(),
     }

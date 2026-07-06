@@ -41,6 +41,34 @@ def _passes_technicals(s: Snapshot) -> bool:
     return True
 
 
+def _passes_pullback(s: Snapshot) -> bool:
+    """Buy-the-dip gate: uptrend intact, price pulled back to SMA20 and held."""
+    if not _is_liquid(s):
+        return False
+    # uptrend intact
+    if not (s.sma20 > s.sma50 and s.close > s.sma50):
+        return False
+    if s.mom_20d < config.PULLBACK_MIN_MOM20:
+        return False
+    # it is a dip, not a rally
+    if s.mom_5d > config.PULLBACK_MAX_MOM5:
+        return False
+    # price tagged SMA20 today...
+    if s.low > s.sma20 * (1 + config.PULLBACK_SMA20_TOUCH_PCT / 100):
+        return False
+    # ...and SMA20 held (no breakdown)
+    if s.close < s.sma20 * (1 - config.PULLBACK_MAX_CLOSE_BELOW_SMA20_PCT / 100):
+        return False
+    if s.closes_below_sma20 > 1:
+        return False
+    # momentum reset but not broken
+    if not (config.PULLBACK_RSI_MIN <= s.rsi <= config.PULLBACK_RSI_MAX):
+        return False
+    if s.macd_hist < s.macd_hist_prev:
+        return False  # downward force still accelerating
+    return True
+
+
 def _rank_score(s: Snapshot, sentiment: float) -> tuple[float, list[str]]:
     score = 2.0 * sentiment
     notes = []
@@ -157,6 +185,60 @@ def scan_news_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
     return _insert_candidates(conn, candidates[:top_n], date, "NEWS")
 
 
+def scan_pullback_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
+                        sentiments: dict[str, dict], date: str,
+                        warnings: list[str], top_n: int | None = None) -> list[dict]:
+    """Pullback channel (Channel C): buy the dip to SMA20 inside an uptrend.
+
+    Gate: uptrend (SMA20>SMA50, +20d momentum) with a <=0 5-day return, day's
+    low tagging SMA20 and the close holding it, RSI reset to 35-55, MACD
+    histogram no longer deteriorating; then the usual fundamentals, sentiment
+    veto, and pivot-ladder R:R >= PULLBACK_MIN_REWARD_RISK.
+    """
+    top_n = top_n if top_n is not None else config.MAX_PULLBACK_PICKS_PER_DAY
+    active = {p["ticker"] for p in db.get_active_picks(conn)}
+
+    candidates: list[Candidate] = []
+    for ticker in config.WATCHLIST:
+        s = snapshots.get(ticker)
+        if s is None or ticker in active:
+            continue
+        if not _passes_pullback(s):
+            continue
+
+        target, stop = derive_target_stop(s, config.MIN_UPSIDE_PCT, config.MAX_RISK_PCT)
+        if target is None:
+            continue
+        upside = (target - s.close) / s.close * 100
+        risk = (s.close - stop) / s.close * 100
+        if upside < config.MIN_UPSIDE_PCT or risk <= 0:
+            continue
+        rr = upside / risk
+        if rr < config.PULLBACK_MIN_REWARD_RISK:
+            continue
+
+        if not fundamentals.check_fundamentals(conn, ticker, date, warnings):
+            continue
+
+        sent = sentiments.get(ticker, {"score": 0.0})["score"] or 0.0
+        if sent <= config.SENTIMENT_ENTRY_MIN:
+            continue
+
+        score, notes = _rank_score(s, sent)
+        # shallower dips are healthier: bonus shrinks as close strays from SMA20
+        dip_depth = abs(s.close - s.sma20) / s.sma20 * 100
+        score += max(0.0, 1.0 - dip_depth)
+        tier = config.TIER.get(ticker, "LARGE")
+        base = (f"[{tier}] PULLBACK: uptrend intact (SMA20>SMA50, 20d {s.mom_20d:+.1f}%), "
+                f"dipped to SMA20 (5d {s.mom_5d:+.1f}%), RSI {s.rsi:.0f} reset, "
+                f"MACD hist turning; R:R {rr:.1f}")
+        rationale = base + ("; " + ", ".join(notes) if notes else "")
+        candidates.append(Candidate(s, target, stop, rr, sent, score, rationale))
+
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return _insert_candidates(conn, candidates[:top_n], date, "PULLBACK")
+
+
 def _insert_candidates(conn: sqlite3.Connection, candidates: list[Candidate],
                        date: str, channel: str) -> list[dict]:
     inserted = []
@@ -175,7 +257,9 @@ def _insert_candidates(conn: sqlite3.Connection, candidates: list[Candidate],
             "rationale": c.rationale,
             "channel": channel,
         }
-        if db.insert_pick(conn, pick):
+        pick_id = db.insert_pick(conn, pick)
+        if pick_id:
+            pick["id"] = pick_id  # paper engine records this as provenance
             pick["reward_risk"] = round(c.reward_risk, 2)
             inserted.append(pick)
     return inserted
