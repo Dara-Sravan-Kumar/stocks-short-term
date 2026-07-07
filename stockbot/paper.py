@@ -263,9 +263,10 @@ def mark_to_market(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
             "ticker": p["ticker"], "strategy": p["strategy"], "qty": p["qty"],
             "entry_fill_price": p["entry_fill_price"], "entry_date": p["entry_date"],
             "ltp": round(ltp, 2), "value": round(value, 2),
-            "cost_basis": p["cost_basis"],
+            "cost_basis": p["cost_basis"], "entry_charges": p["entry_charges"],
             "unrealized_pnl": round(value - p["cost_basis"], 2),
             "target_price": p["target_price"], "stop_price": p["stop_price"],
+            "rationale": p["rationale"],
         })
     realized_cum = db.get_realized_pnl_cum(conn)
     equity = book["cash"] + positions_value

@@ -245,6 +245,45 @@ def build_paper_embeds(run_date: str, paper_entries: list[dict],
         "description": _clip(desc, 4000),
         "color": PURPLE,
     })
+
+    open_positions = paper_book.get("open_positions") or []
+    if open_positions:
+        fields = []
+        for p in open_positions:
+            pnl = p["unrealized_pnl"]
+            pnl_pct = pnl / p["cost_basis"] * 100 if p["cost_basis"] else 0.0
+            ltp = p["ltp"]
+            to_tgt = (p["target_price"] - ltp) / ltp * 100 if ltp else 0.0
+            to_stop = (p["stop_price"] - ltp) / ltp * 100 if ltp else 0.0
+            arrow = ":small_red_triangle:" if pnl >= 0 else ":small_red_triangle_down:"
+            fields.append({
+                "name": f"{arrow} {p['ticker']}  [{p['strategy']}]",
+                "value": _clip(
+                    f"Entry: **{p['entry_fill_price']:.2f}** x {p['qty']} "
+                    f"({p['entry_date']})  |  Cost basis: ₹{p['cost_basis']:,.0f} "
+                    f"(incl. ₹{p['entry_charges']:.0f} charges)\n"
+                    f"LTP: **{ltp:.2f}**  |  Value: ₹{p['value']:,.0f}  |  "
+                    f"Unrl P&L: **₹{pnl:+,.0f} ({pnl_pct:+.2f}%)**\n"
+                    f"Target: **{p['target_price']:.2f}** ({to_tgt:+.1f}%)  |  "
+                    f"Stop: **{p['stop_price']:.2f}** ({to_stop:+.1f}%)\n"
+                    f"_{p.get('rationale', '')}_"
+                ),
+                "inline": False,
+            })
+        total_invested = sum(p["cost_basis"] for p in open_positions)
+        total_value = sum(p["value"] for p in open_positions)
+        total_pnl = total_value - total_invested
+        total_pnl_pct = total_pnl / total_invested * 100 if total_invested else 0.0
+        embeds.append({
+            "title": f":bar_chart: OPEN POSITIONS - Full Ledger ({run_date})",
+            "color": BLUE,
+            "fields": fields[:25],
+            "footer": {"text": (
+                f"Cash invested: ₹{total_invested:,.0f}  |  "
+                f"Current value: ₹{total_value:,.0f}  |  "
+                f"Total P/L: ₹{total_pnl:+,.0f} ({total_pnl_pct:+.2f}%)"
+            )},
+        })
     return embeds
 
 
