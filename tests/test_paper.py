@@ -75,6 +75,29 @@ def test_size_position_rejects_bad_stop():
 
 
 # ---------------------------------------------------------------------------
+# Per-strategy capital budget guard — "split money accordingly" so one
+# strategy variant can't front-run the whole shared book (config.STRATEGY_*).
+# ---------------------------------------------------------------------------
+
+def test_size_position_respects_budget_cap():
+    # Unconstrained, the position cap binds at 7 (see worked example above).
+    # A tight strategy budget (3 shares' worth) becomes the new binding
+    # constraint — 1600 rather than 1000 so the result still clears
+    # PAPER_MIN_POSITION_VALUE (else it would be skipped as too small, not capped).
+    qty, note = paper.size_position(equity=10_000, cash=10_000,
+                                    entry_ref=500.0, stop=482.0, budget_cap=1600.0)
+    assert qty == 3
+    assert "strategy budget" in note
+
+
+def test_size_position_budget_cap_exhausted_skips():
+    qty, note = paper.size_position(equity=10_000, cash=10_000,
+                                    entry_ref=500.0, stop=482.0, budget_cap=0.0)
+    assert qty == 0
+    assert "strategy budget exhausted" in note
+
+
+# ---------------------------------------------------------------------------
 # Ledger round trip on a scratch DB — cash, ledger, and P&L must reconcile
 # ---------------------------------------------------------------------------
 
@@ -99,10 +122,13 @@ def test_open_close_round_trip_reconciles(conn):
                                           "AM", warnings)
     assert len(buys) == 1 and buys[0]["action"] == "BUY"
     buy = buys[0]
-    assert buy["qty"] == 7
+    # 40%-of-equity position cap binds at this book size (see size_position tests
+    # for the worked-example math) — assert the invariant rather than a magic number
+    assert buy["invested"] <= config.PAPER_STARTING_CASH * config.PAPER_MAX_POSITION_PCT / 100
 
     book = db.get_paper_book(conn)
-    assert book["cash"] == pytest.approx(10_000 - buy["invested"], abs=0.01)
+    assert book["cash"] == pytest.approx(
+        config.PAPER_STARTING_CASH - buy["invested"], abs=0.01)
 
     sells = paper.close_positions_for_exits(
         conn, [{"ticker": "TESTX.NS", "status": "TARGET_HIT",
@@ -116,13 +142,13 @@ def test_open_close_round_trip_reconciles(conn):
         sell["net_proceeds"] - buy["invested"], abs=0.01)
     book = db.get_paper_book(conn)
     assert book["cash"] == pytest.approx(
-        10_000 - buy["invested"] + sell["net_proceeds"], abs=0.02)
+        config.PAPER_STARTING_CASH - buy["invested"] + sell["net_proceeds"], abs=0.02)
 
     # ledger has exactly one BUY and one SELL whose net_amounts sum to cash delta
     trades = conn.execute("SELECT * FROM paper_trades ORDER BY id").fetchall()
     assert [t["side"] for t in trades] == ["BUY", "SELL"]
     net = sum(t["net_amount"] for t in trades)
-    assert book["cash"] == pytest.approx(10_000 + net, abs=0.02)
+    assert book["cash"] == pytest.approx(config.PAPER_STARTING_CASH + net, abs=0.02)
 
     # position closed with attribution intact
     pos = conn.execute("SELECT * FROM paper_positions").fetchone()
@@ -162,6 +188,31 @@ def test_duplicate_open_position_rejected(conn):
                                    "AM", warnings)
     assert db.get_paper_book(conn)["cash"] == cash_before
     assert any("already exists" in w for w in warnings)
+
+
+def test_open_positions_for_picks_respects_capital_weights(conn):
+    warnings = []
+    # NEWS gets a tiny 5% weight of the shared book — far below what an
+    # unconstrained position would want, so its size should be capped to fit.
+    weights = {"NEWS": 5.0, "TECHNICAL": 95.0}
+    actions = paper.open_positions_for_picks(
+        conn, [_pick(channel="NEWS")], {}, "2026-07-06", "AM", warnings,
+        capital_weights=weights)
+    assert len(actions) == 1
+    action = actions[0]
+    budget = config.PAPER_STARTING_CASH * 0.05
+    if action["action"] == "BUY":
+        assert action["invested"] <= budget + 1.0  # small slack for fill rounding
+    else:
+        assert "budget" in action["note"]
+
+
+def test_open_positions_for_picks_unweighted_strategy_is_unconstrained(conn):
+    warnings = []
+    actions = paper.open_positions_for_picks(
+        conn, [_pick(channel="TECHNICAL")], {}, "2026-07-06", "AM", warnings,
+        capital_weights={"NEWS": 50.0})  # TECHNICAL absent from the map - no cap
+    assert actions[0]["action"] == "BUY"
 
 
 def test_mark_to_market_logs_equity_curve(conn):

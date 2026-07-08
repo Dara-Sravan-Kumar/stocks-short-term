@@ -143,7 +143,9 @@ MIN_UPSIDE_PCT = 2.0           # target must be >= 2% above entry
 MIN_REWARD_RISK = 1.5
 MAX_RISK_PCT = 5.0             # stop clamped to at most 5% below entry
 SENTIMENT_ENTRY_MIN = -0.2     # sentiment must be above this to allow entry
-MAX_NEW_PICKS_PER_DAY = 3      # per channel (technical)
+MAX_NEW_PICKS_PER_DAY = None   # None = uncapped; capital efficiency (strategy_engine
+                               # capital weights + paper.py cash/risk sizing) is the
+                               # real limiter now, not an arbitrary per-day pick count
 
 # ---------------------------------------------------------------------------
 # News-first channel (Channel B): news is the primary signal
@@ -206,7 +208,7 @@ CLAUDE_CLI_TIMEOUT = 300       # seconds per batched call
 # Paper trading — one shared virtual book, positions tagged by strategy
 # ---------------------------------------------------------------------------
 PAPER_STRATEGIES = ["TECHNICAL", "NEWS", "PULLBACK"]
-PAPER_STARTING_CASH = 10_000.0   # INR, single shared cash pool
+PAPER_STARTING_CASH = 100_000.0  # INR, single shared cash pool
 PAPER_RISK_PCT_PER_TRADE = 1.5   # % of book equity risked between entry and stop
 PAPER_MAX_POSITION_PCT = 40.0    # max position value as % of book equity
 PAPER_MIN_CASH_BUFFER = 50.0     # cash kept free for charges (INR)
@@ -233,8 +235,163 @@ PULLBACK_RSI_MAX = 55.0                 # below TECHNICAL's 45-68 window
 PULLBACK_MIN_MOM20 = 3.0                # 20d momentum proves uptrend (%)
 PULLBACK_MAX_MOM5 = 0.0                 # 5d momentum <= 0 proves a dip (%)
 PULLBACK_MIN_REWARD_RISK = 1.5
-MAX_PULLBACK_PICKS_PER_DAY = 3
+MAX_PULLBACK_PICKS_PER_DAY = None       # None = uncapped, see MAX_NEW_PICKS_PER_DAY note
 PULLBACK_SETUP_BROKEN_SMA_BARS = 3      # entry IS at SMA20; default 2 would whipsaw
+
+# ---------------------------------------------------------------------------
+# Order Flow channel — Chaikin Money Flow as a daily-bar order-flow proxy.
+# Real order flow needs tick/bid-ask data; CMF approximates buying/selling
+# pressure from where each day's close sits in its range, weighted by volume.
+# ---------------------------------------------------------------------------
+ORDERFLOW_CMF_MIN = 0.05          # minimum CMF(20) - mild net buying pressure
+ORDERFLOW_MIN_REWARD_RISK = 1.5
+MAX_ORDERFLOW_PICKS_PER_DAY = None
+
+# ---------------------------------------------------------------------------
+# Liquidity Sweep channel — daily-bar "stop hunt then reclaim" (Wyckoff spring):
+# today's low undercuts the prior 10-bar swing low but closes back above it,
+# in the upper half of the day's range.
+# ---------------------------------------------------------------------------
+LIQSWEEP_MIN_REVERSAL_STRENGTH = 0.5   # (close-low)/(high-low) - close in upper half of range
+LIQSWEEP_MIN_REWARD_RISK = 1.5
+MAX_LIQUIDITY_SWEEP_PICKS_PER_DAY = None
+
+# ---------------------------------------------------------------------------
+# Fair Value Gap channel — classic 3-candle imbalance, entered on a retest.
+# ---------------------------------------------------------------------------
+FVG_LOOKBACK_BARS = 15            # window scanned for an unfilled bullish FVG (global, not per-variant)
+FVG_MIN_REWARD_RISK = 1.5
+MAX_FVG_PICKS_PER_DAY = None
+
+# ---------------------------------------------------------------------------
+# Anchored VWAP channel — VWAP anchored to the most recent swing low (a daily-
+# bar approximation; true anchored VWAP normally anchors to an intraday event).
+# ---------------------------------------------------------------------------
+AVWAP_LOOKBACK_BARS = 60           # window used to pick the anchor swing low (global)
+AVWAP_RECLAIM_TOLERANCE_PCT = 1.0  # close must clear anchored VWAP by at least this %
+AVWAP_MIN_REWARD_RISK = 1.5
+MAX_ANCHORED_VWAP_PICKS_PER_DAY = None
+
+# ---------------------------------------------------------------------------
+# Volume Profile channel — pullback to the 60-bar Point-of-Control proxy (a
+# daily-bar volume-weighted price histogram; not real intraday volume-at-price).
+# ---------------------------------------------------------------------------
+VOLPROFILE_LOOKBACK_BARS = 60      # global (see AVWAP note on lookback vs threshold)
+VOLPROFILE_BINS = 20               # global
+VOLPROFILE_TOUCH_TOLERANCE_PCT = 1.0   # how close to POC counts as "at" it
+VOLPROFILE_MIN_REWARD_RISK = 1.5
+MAX_VOLUME_PROFILE_PICKS_PER_DAY = None
+
+# ---------------------------------------------------------------------------
+# 52-Week High Breakout channel — classic momentum-leadership breakout.
+# ---------------------------------------------------------------------------
+BREAKOUT52W_TOLERANCE_PCT = 2.0    # close within this % of the 252d high counts as "at" it
+BREAKOUT52W_MIN_VOL_RATIO = 1.3    # volume confirmation
+BREAKOUT52W_MIN_REWARD_RISK = 1.5
+MAX_BREAKOUT_52W_PICKS_PER_DAY = None
+
+# ---------------------------------------------------------------------------
+# Market crash detection (feeds strategy_daily_context)
+# ---------------------------------------------------------------------------
+MARKET_CRASH_THRESHOLD_PCT = -3.0   # single-day Nifty/Bank Nifty return below this = "crash"
+GLOBAL_CRASH_THRESHOLD_PCT = -2.0   # US indices are typically less volatile day-to-day
+
+# ---------------------------------------------------------------------------
+# Strategy engine — TECHNICAL & PULLBACK become fleets of competing parameter
+# variants, judged on paper-trade outcomes (stockbot/strategy_engine.py).
+# NEWS is out of scope: it stays a single fixed strategy, but keeps a row in
+# the strategies table so capital weighting spans all live strategies evenly.
+# ---------------------------------------------------------------------------
+STRATEGY_MIN_TRADES_FOR_RETIREMENT = 30   # closed trades before a variant can be judged
+STRATEGY_STALLED_DAYS = 120               # force a review if still <30 trades after this many days
+STRATEGY_RETIREMENT_WIN_RATE_FLOOR = 35.0 # retire if win rate is below this AND trades >= min
+STRATEGY_GRADUATE_MIN_TRADES = 50         # sample size required to flag as graduate-candidate
+STRATEGY_GRADUATE_WIN_RATE = 55.0         # win rate required to flag as graduate-candidate
+STRATEGY_MIN_CAPITAL_WEIGHT_PCT = 5.0     # floor: every active strategy gets at least this share
+STRATEGY_MAX_CAPITAL_WEIGHT_PCT = 40.0    # ceiling: no strategy dominates the shared book
+STRATEGY_WILDCARD_INTERVAL_DAYS = 7       # cadence for an extra experimental variant
+STRATEGY_FLEET_SIZE = 3                   # fallback target fleet size (see BY_CHANNEL below)
+STRATEGY_FLEET_MAX = 6                    # fallback hard ceiling (see BY_CHANNEL below)
+STRATEGY_LLM_MODEL = "sonnet"             # reasoning quality matters more than cost here;
+                                           # this runs at most a few times a week, not per-ticker
+
+# All channels the self-evolving fleet manages (NEWS excluded — stays a single
+# fixed strategy, out of scope for retirement/creation per the original ask).
+EVOLVING_CHANNELS = (
+    "TECHNICAL", "PULLBACK", "ORDERFLOW", "LIQUIDITY_SWEEP",
+    "FVG", "ANCHORED_VWAP", "VOLUME_PROFILE", "BREAKOUT_52W",
+)
+# TECHNICAL/PULLBACK are proven — keep their existing 3-variant fleets. The six
+# new channels start leaner (2) until they've earned a bigger footprint; this
+# also keeps total-strategy-count growth (and the capital-weight floor math
+# below) manageable as more channels get added.
+STRATEGY_FLEET_SIZE_BY_CHANNEL = {
+    "TECHNICAL": 3, "PULLBACK": 3,
+    "ORDERFLOW": 2, "LIQUIDITY_SWEEP": 2, "FVG": 2,
+    "ANCHORED_VWAP": 2, "VOLUME_PROFILE": 2, "BREAKOUT_52W": 2,
+}
+STRATEGY_FLEET_MAX_BY_CHANNEL = {
+    "TECHNICAL": 6, "PULLBACK": 6,
+    "ORDERFLOW": 4, "LIQUIDITY_SWEEP": 4, "FVG": 4,
+    "ANCHORED_VWAP": 4, "VOLUME_PROFILE": 4, "BREAKOUT_52W": 4,
+}
+
+# Guardrail bounds for LLM-proposed parameter variants (min, max) per channel.
+# propose_new_variant() clamps any proposal into these ranges before it's ever
+# considered — keeps proposals sane and comparable regardless of what the model returns.
+STRATEGY_PARAM_BOUNDS = {
+    "TECHNICAL": {
+        "rsi_entry_min": (30.0, 55.0),
+        "rsi_entry_max": (55.0, 80.0),
+        "min_reward_risk": (1.2, 3.0),
+    },
+    "PULLBACK": {
+        "pullback_rsi_min": (25.0, 45.0),
+        "pullback_rsi_max": (45.0, 65.0),
+        "pullback_min_mom20": (1.0, 8.0),
+        "pullback_max_mom5": (-3.0, 2.0),
+        "pullback_min_reward_risk": (1.2, 3.0),
+        "pullback_sma20_touch_pct": (0.5, 2.5),
+    },
+    "ORDERFLOW": {
+        "cmf_min": (-0.05, 0.25),
+        "min_reward_risk": (1.2, 3.0),
+    },
+    "LIQUIDITY_SWEEP": {
+        "reversal_strength_min": (0.3, 0.8),
+        "min_reward_risk": (1.2, 3.0),
+    },
+    "FVG": {
+        "min_reward_risk": (1.2, 3.0),
+    },
+    "ANCHORED_VWAP": {
+        "reclaim_tolerance_pct": (0.3, 3.0),
+        "min_reward_risk": (1.2, 3.0),
+    },
+    "VOLUME_PROFILE": {
+        "touch_tolerance_pct": (0.3, 3.0),
+        "min_reward_risk": (1.2, 3.0),
+    },
+    "BREAKOUT_52W": {
+        "tolerance_pct": (0.5, 5.0),
+        "min_vol_ratio": (1.0, 2.5),
+        "min_reward_risk": (1.2, 3.0),
+    },
+}
+
+# Composable optional gate toggles the LLM can combine when proposing a
+# "wildcard" variant (mode="wildcard") — real novelty without executing
+# arbitrary unattended LLM-authored code. Each key maps to a tested predicate
+# in stockbot/signals.py's TOGGLE_CONDITIONS registry.
+STRATEGY_TOGGLE_LIBRARY = [
+    "require_volume_surge",              # 20d avg volume ratio > VOL_RATIO_BONUS_THRESHOLD
+    "require_close_above_weekly_r1",     # stronger breakout: close clears last week's R1
+    "require_sector_relative_strength",  # ticker's 20d momentum beats its tier's median
+    "require_positive_order_flow",       # CMF(20) > 0 - net buying pressure
+    "require_above_anchored_vwap",       # close above the anchored VWAP
+    "require_near_volume_poc_support",   # close at/above the 60-bar volume POC
+    "require_near_52w_high",             # close within BREAKOUT52W_TOLERANCE_PCT of the 252d high
+]
 
 # ---------------------------------------------------------------------------
 # OpenAlgo broker bridge (holdings sync from INDmoney; creds in .env)
@@ -273,4 +430,5 @@ def discord_settings() -> dict:
         "picks_channel": os.getenv("DISCORD_PICKS_CHANNEL_ID", "").strip(),
         "holdings_channel": os.getenv("DISCORD_HOLDINGS_CHANNEL_ID", "").strip(),
         "paper_channel": os.getenv("DISCORD_PAPER_CHANNEL_ID", "").strip(),
+        "strategy_channel": os.getenv("DISCORD_STRATEGY_CHANNEL_ID", "").strip(),
     }

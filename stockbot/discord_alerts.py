@@ -16,8 +16,25 @@ GREEN = 0x2ECC71
 BLUE = 0x3498DB
 PURPLE = 0x9B59B6
 GREY = 0x95A5A6
+GOLD = 0xF1C40F
 
 _LEVEL_EMOJI = {"green": ":green_circle:", "yellow": ":yellow_circle:", "red": ":red_circle:"}
+
+_CHANNEL_ICON = {
+    "NEWS": ":newspaper:", "PULLBACK": ":arrow_heading_down:",
+    "ORDERFLOW": ":twisted_rightwards_arrows:", "LIQUIDITY_SWEEP": ":shark:",
+    "FVG": ":left_right_arrow:", "ANCHORED_VWAP": ":anchor:",
+    "VOLUME_PROFILE": ":bar_chart:", "BREAKOUT_52W": ":rocket:",
+}  # TECHNICAL (and anything unmatched) falls back to :chart_with_upwards_trend:
+
+
+def _base_channel(channel: str) -> str:
+    """Strip a strategy variant key (e.g. "PULLBACK_v2") back to its base
+    channel name so display coloring/icons stay consistent across variants."""
+    for prefix in (*config.EVOLVING_CHANNELS, "NEWS"):
+        if channel == prefix or channel.startswith(prefix + "_"):
+            return prefix
+    return channel
 
 
 def _post(token: str, channel_id: str, payload: dict, warnings: list[str]) -> bool:
@@ -89,8 +106,7 @@ def build_picks_embeds(run_date: str, exits: list[dict], new_picks: list[dict],
         fields = []
         for p in new_picks:
             channel = p.get("channel", "TECHNICAL")
-            icon = {"NEWS": ":newspaper:", "PULLBACK": ":arrow_heading_down:"}.get(
-                channel, ":chart_with_upwards_trend:")
+            icon = _CHANNEL_ICON.get(_base_channel(channel), ":chart_with_upwards_trend:")
             fields.append({
                 "name": f"{icon} {p['ticker']}  [{channel}]",
                 "value": _clip(
@@ -287,12 +303,81 @@ def build_paper_embeds(run_date: str, paper_entries: list[dict],
     return embeds
 
 
+def build_strategy_ledger_embed(run_date: str, strategy_ledger: dict) -> list[dict]:
+    """strategy_ledger is stockbot.strategy_engine.evaluate_and_evolve()'s return
+    value: active variants per channel, their closed-trade stats, today's capital
+    weights, and any retire/create events from this run.
+    """
+    active_by_channel = strategy_ledger.get("active_by_channel", {})
+    ledger_stats = strategy_ledger.get("ledger_stats", {})
+    capital_weights = strategy_ledger.get("capital_weights", {})
+    events = strategy_ledger.get("events", [])
+
+    fields = []
+    for channel in (*config.EVOLVING_CHANNELS, "NEWS"):
+        for variant in active_by_channel.get(channel, []):
+            key = variant["variant_key"]
+            stats = ledger_stats.get(key, {"closed": 0, "win_rate": 0.0, "realized_pnl": 0.0})
+            weight = capital_weights.get(key, 0.0)
+            flag = "  :trophy:" if variant["graduate_candidate"] else ""
+            fields.append({
+                "name": f"{key}{flag}",
+                "value": _clip(
+                    f"Closed: **{stats['closed']}**  |  Win rate: **{stats['win_rate']:.0f}%**  |  "
+                    f"Realized P&L: **₹{stats['realized_pnl']:+,.0f}**\n"
+                    f"Capital weight: **{weight:.0f}%**  |  Origin: {variant['origin']}"
+                ),
+                "inline": False,
+            })
+
+    embeds = [{
+        "title": f":dna: STRATEGY LEDGER - {run_date}",
+        "color": GOLD,
+        "fields": fields[:25],
+    }]
+
+    if events:
+        lines = []
+        for e in events:
+            if e["type"] == "retired":
+                lines.append(f":skull: **{e['variant_key']}** retired — {e['reason']}")
+            elif e["type"] == "created":
+                lines.append(f":seedling: **{e['variant_key']}** created, replacing "
+                             f"**{e['parent']}** — {e['rationale']}")
+            elif e["type"] == "wildcard_created":
+                lines.append(f":game_die: **{e['variant_key']}** wildcard added — {e['rationale']}")
+            elif e["type"] == "graduate_candidate":
+                lines.append(f":trophy: **{e['variant_key']}** flagged as a graduate candidate "
+                             "— paper-proven, your call on going live")
+        embeds.append({
+            "title": ":arrows_counterclockwise: STRATEGY CHANGES TODAY",
+            "description": _clip("\n\n".join(lines), 4000),
+            "color": GOLD,
+        })
+    return embeds
+
+
+def has_reportable_activity(closed: list[dict], new_picks: list[dict],
+                            paper_entries: list[dict] | None,
+                            paper_exits: list[dict] | None,
+                            strategy_events: list[dict] | None) -> bool:
+    """True if this run produced anything worth alerting on: an exit, a new
+    pick, an actual paper BUY/SELL (not a SKIP), or a strategy-fleet event
+    (retired/created/wildcard/graduate). Used to keep hourly in-between runs
+    (--skip-news) quiet on Discord when nothing happened, while the twice-
+    daily anchor runs always report regardless of this check.
+    """
+    paper_buys = [a for a in (paper_entries or []) if a.get("action") == "BUY"]
+    return bool(closed or new_picks or paper_buys or paper_exits or strategy_events)
+
+
 def send_report(run_date: str, exits: list[dict], new_picks: list[dict],
                 active_picks: list[dict], holdings: list[dict], stats: dict,
                 warnings: list[str], paper_entries: list[dict] | None = None,
                 paper_exits: list[dict] | None = None,
                 paper_book: dict | None = None,
-                holdings_note: str | None = None) -> str:
+                holdings_note: str | None = None,
+                strategy_ledger: dict | None = None) -> str:
     """Send picks + holdings (+ paper book) Discord messages. Returns status text."""
     cfg = config.discord_settings()
     if not cfg["token"] or not cfg["picks_channel"]:
@@ -303,6 +388,7 @@ def send_report(run_date: str, exits: list[dict], new_picks: list[dict],
     picks_channel = cfg["picks_channel"]
     holdings_channel = cfg["holdings_channel"] or picks_channel
     paper_channel = cfg["paper_channel"] or picks_channel
+    strategy_channel = cfg["strategy_channel"] or picks_channel
 
     ok = True
     for chunk in _chunk_embeds(build_picks_embeds(run_date, exits, new_picks, active_picks)):
@@ -316,5 +402,9 @@ def send_report(run_date: str, exits: list[dict], new_picks: list[dict],
         for chunk in _chunk_embeds(build_paper_embeds(
                 run_date, paper_entries or [], paper_exits or [], paper_book)):
             ok &= _post(cfg["token"], paper_channel, {"embeds": chunk}, warnings)
+            time.sleep(0.5)
+    if strategy_ledger is not None:
+        for chunk in _chunk_embeds(build_strategy_ledger_embed(run_date, strategy_ledger)):
+            ok &= _post(cfg["token"], strategy_channel, {"embeds": chunk}, warnings)
             time.sleep(0.5)
     return "sent" if ok else "partial failure"

@@ -72,9 +72,12 @@ def sell_costs(qty: int, fill_price: float) -> CostBreakdown:
 
 
 def size_position(equity: float, cash: float, entry_ref: float,
-                  stop: float) -> tuple[int, str]:
+                  stop: float, budget_cap: float | None = None) -> tuple[int, str]:
     """Risk-based sizing: qty risking PAPER_RISK_PCT_PER_TRADE of equity
-    between entry and stop, capped by position-% and affordable cash.
+    between entry and stop, capped by position-%, affordable cash, and
+    (optionally) the calling strategy's remaining capital budget for today
+    — the "split money accordingly" guard so one strategy can't front-run
+    the whole shared book.
 
     Returns (qty, note); qty 0 means skip and the note says why.
     """
@@ -94,8 +97,14 @@ def size_position(equity: float, cash: float, entry_ref: float,
     available = cash - config.PAPER_MIN_CASH_BUFFER - fixed_buy
     qty_cash = math.floor(available / (fill * (1 + var_rate))) if available > 0 else 0
 
-    qty = min(qty_risk, qty_pos, qty_cash)
+    caps = {"risk": qty_risk, "position cap": qty_pos, "cash": qty_cash}
+    if budget_cap is not None:
+        caps["strategy budget"] = math.floor(budget_cap / fill) if budget_cap > 0 else 0
+
+    qty = min(caps.values())
     if qty < 1:
+        if caps.get("strategy budget") == 0:
+            return 0, "strategy budget exhausted for today"
         if qty_cash < 1:
             return 0, f"insufficient cash (Rs {cash:,.0f} free)"
         if qty_risk < 1:
@@ -106,9 +115,9 @@ def size_position(equity: float, cash: float, entry_ref: float,
         return 0, (f"position too small (Rs {qty * fill:,.0f} < "
                    f"Rs {config.PAPER_MIN_POSITION_VALUE:,.0f} minimum - "
                    "fixed charges would eat returns)")
-    binding = ("risk" if qty == qty_risk else
-               "position cap" if qty == qty_pos else "cash")
-    return qty, f"sized by {binding} (risk {qty_risk} / cap {qty_pos} / cash {qty_cash})"
+    binding = min(caps, key=caps.get)
+    detail = ", ".join(f"{name} {q}" for name, q in caps.items())
+    return qty, f"sized by {binding} ({detail})"
 
 
 def _positions_value(positions, snapshots: dict[str, Snapshot]) -> float:
@@ -122,11 +131,19 @@ def _positions_value(positions, snapshots: dict[str, Snapshot]) -> float:
 
 def open_positions_for_picks(conn: sqlite3.Connection, new_picks: list[dict],
                              snapshots: dict[str, Snapshot], run_date: str,
-                             run_slot: str, warnings: list[str]) -> list[dict]:
+                             run_slot: str, warnings: list[str],
+                             capital_weights: dict[str, float] | None = None) -> list[dict]:
     """Paper-buy every new pick (any channel) from the shared cash pool.
+
+    capital_weights (from strategy_engine.evaluate_and_evolve), if given, caps
+    each strategy's total deployed capital at weight% of book equity — this is
+    what keeps one variant from front-running the whole shared book on a day
+    with no per-channel pick limit. Strategies absent from the mapping are
+    unconstrained (e.g. when called without the strategy engine wired up).
 
     Returns one action dict per pick: executed BUYs and visible SKIPs.
     """
+    capital_weights = capital_weights or {}
     actions = []
     for pick in new_picks:
         book = db.get_paper_book(conn)
@@ -136,7 +153,15 @@ def open_positions_for_picks(conn: sqlite3.Connection, new_picks: list[dict],
         ticker = pick["ticker"]
         strategy = pick.get("channel", "TECHNICAL")
         entry_ref = pick["entry_price"]
-        qty, note = size_position(equity, book["cash"], entry_ref, pick["stop_price"])
+
+        budget_cap = None
+        weight_pct = capital_weights.get(strategy)
+        if weight_pct is not None:
+            deployed = db.get_deployed_capital_by_strategy(conn).get(strategy, 0.0)
+            budget_cap = equity * weight_pct / 100.0 - deployed
+
+        qty, note = size_position(equity, book["cash"], entry_ref,
+                                  pick["stop_price"], budget_cap=budget_cap)
         if qty < 1:
             actions.append({
                 "action": "SKIP", "ticker": ticker, "strategy": strategy,

@@ -54,8 +54,12 @@ def evaluate_active_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapsho
             sent = (sentiments.get(ticker) or {}).get("score", 0.0) or 0.0
             # pullback entries sit AT SMA20, so they get more room before the
             # consecutive-closes-below rule fires
+            # pick["channel"] now holds a variant_key like "PULLBACK_v2", not the
+            # bare channel name — variant keys are always prefixed with their
+            # base channel (see stockbot/db.py's strategies table), so a prefix
+            # check recovers it without a lookup.
             sma_bars = (config.PULLBACK_SETUP_BROKEN_SMA_BARS
-                        if pick["channel"] == "PULLBACK"
+                        if pick["channel"].startswith("PULLBACK")
                         else config.SETUP_BROKEN_SMA_BARS)
             if snap.closes_below_sma20 >= sma_bars:
                 status = "SETUP_BROKEN"

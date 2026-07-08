@@ -6,9 +6,26 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
+import config
+
 console = Console()
 
 _LEVEL_STYLE = {"green": "green", "yellow": "yellow", "red": "bold red"}
+
+_CHANNEL_STYLE = {
+    "NEWS": "yellow", "PULLBACK": "magenta",
+    "ORDERFLOW": "blue", "LIQUIDITY_SWEEP": "dark_orange", "FVG": "bright_magenta",
+    "ANCHORED_VWAP": "bright_blue", "VOLUME_PROFILE": "gold3", "BREAKOUT_52W": "bright_green",
+}  # TECHNICAL (and anything unmatched) falls back to "cyan"
+
+
+def _base_channel(channel: str) -> str:
+    """Strip a strategy variant key (e.g. "PULLBACK_v2") back to its base
+    channel name so display coloring stays consistent across variants."""
+    for prefix in (*config.EVOLVING_CHANNELS, "NEWS"):
+        if channel == prefix or channel.startswith(prefix + "_"):
+            return prefix
+    return channel
 
 
 def _fmt(v, spec=".2f", dash="-"):
@@ -73,7 +90,7 @@ def render(run_date: str, data_date: str, tickers_scanned: int, llm_status: str,
     if new_picks:
         for p in new_picks:
             ch = p.get("channel", "TECHNICAL")
-            ch_style = {"NEWS": "yellow", "PULLBACK": "magenta"}.get(ch, "cyan")
+            ch_style = _CHANNEL_STYLE.get(_base_channel(ch), "cyan")
             t.add_row(
                 p["ticker"], f"[{ch_style}]{ch}[/]",
                 _fmt(p["entry_price"]), _fmt(p["target_price"]),

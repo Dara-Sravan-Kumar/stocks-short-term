@@ -1,11 +1,19 @@
 """stockbot daily orchestrator.
 
 Usage:
-    python run_daily.py [--no-llm] [--no-discord] [--top N]
+    python run_daily.py [--no-llm] [--no-discord] [--skip-news] [--top N]
+
+--skip-news is for hourly in-between runs (see run_stockbot.ps1 -SkipNews):
+news fetch and fresh LLM sentiment scoring are skipped entirely (the per-slot
+sentiment cache still serves anything scored earlier that AM/PM slot), and
+the Discord report is only sent if something actually happened this run.
+Exits, strategy-fleet evaluation, all channel scans, and paper trading still
+run in full every invocation, hourly or not.
 
 Pipeline:
     init db/seed -> batched OHLCV download -> indicators + pivots ->
     news + LLM sentiment (cached) -> exit evaluation of ACTIVE picks ->
+    strategy fleet evaluation (retire/create/capital weights) ->
     new-pick scan -> holdings health check -> rich dashboard ->
     Discord alerts -> run log
 """
@@ -19,7 +27,7 @@ from dotenv import load_dotenv
 
 import config
 from stockbot import db, market_data, news, sentiment, signals, exits, portfolio
-from stockbot import dashboard, discord_alerts, paper, broker
+from stockbot import dashboard, discord_alerts, paper, broker, strategy_engine
 from stockbot.indicators import compute_snapshot
 
 
@@ -29,6 +37,9 @@ def main() -> int:
                         help="skip Claude CLI sentiment (neutral scores)")
     parser.add_argument("--no-discord", action="store_true",
                         help="skip Discord alerts")
+    parser.add_argument("--skip-news", action="store_true",
+                        help="skip news fetch + fresh LLM sentiment (hourly in-between runs); "
+                             "Discord only sends if this run had actual activity")
     parser.add_argument("--top", type=int, default=config.MAX_NEW_PICKS_PER_DAY,
                         help="max new picks per day")
     parser.add_argument("--refresh-universe", action="store_true",
@@ -85,36 +96,50 @@ def main() -> int:
             warnings.append(f"{ticker}: indicator computation failed ({exc}) - skipped")
 
     # ------------------------------------------------------- news + sentiment
-    # News-first channel sweeps every LIQUID ticker (illiquid names could
-    # never become picks, so their news is skipped to bound runtime).
-    from stockbot.signals import _is_liquid
-    liquid = [t for t, s in snapshots.items() if _is_liquid(s)]
-    news_universe = sorted(set(liquid) | set(active) | set(held))
-    print(f"Collecting news for {len(news_universe)} liquid tickers "
-          f"(of {len(universe)} scanned, parallel)...")
-    headlines = news.fetch_headlines_bulk(news_universe, warnings)
-
-    # Score sentiment for: tickers with fresh headlines (news channel),
-    # plus technical/pullback-screen survivors, active picks, and holdings.
-    from stockbot.signals import _passes_technicals, _passes_pullback  # internal reuse
+    from stockbot.signals import _is_liquid, _passes_technicals, _passes_pullback
+    # Screened against each channel's default/seed thresholds — a quick net-widener
+    # for sentiment scoring, not the actual per-variant gate the picks scan applies.
+    _tech_defaults = strategy_engine.resolve_params("TECHNICAL", None)
+    _pullback_defaults = strategy_engine.resolve_params("PULLBACK", None)
     screen_survivors = [
         t for t in config.WATCHLIST
         if t in snapshots and t not in active
-        and (_passes_technicals(snapshots[t]) or _passes_pullback(snapshots[t]))
+        and (_passes_technicals(snapshots[t], _tech_defaults)
+             or _passes_pullback(snapshots[t], _pullback_defaults))
     ]
-    with_news = [t for t, hl in headlines.items() if hl]
-    sentiment_universe = sorted(set(with_news) | set(screen_survivors)
-                                | set(active) | set(held))
-    headlines = {t: headlines.get(t, []) for t in sentiment_universe}
 
-    use_llm = not args.no_llm
-    if use_llm:
-        print(f"Scoring sentiment for {len(headlines)} tickers via Claude CLI "
-              f"(cached per {run_slot} run)...")
+    if args.skip_news:
+        # Hourly in-between run: no news fetch, no fresh LLM calls. Still look
+        # up whatever's cached from this AM/PM slot's real news run for the
+        # tickers gates/exits care about right now.
+        print("Skipping news fetch (--skip-news) - using cached sentiment only...")
+        sentiment_universe = sorted(set(screen_survivors) | set(active) | set(held))
+        headlines = {t: [] for t in sentiment_universe}
+        use_llm = False
+    else:
+        # News-first channel sweeps every LIQUID ticker (illiquid names could
+        # never become picks, so their news is skipped to bound runtime).
+        liquid = [t for t, s in snapshots.items() if _is_liquid(s)]
+        news_universe = sorted(set(liquid) | set(active) | set(held))
+        print(f"Collecting news for {len(news_universe)} liquid tickers "
+              f"(of {len(universe)} scanned, parallel)...")
+        headlines = news.fetch_headlines_bulk(news_universe, warnings)
+
+        with_news = [t for t, hl in headlines.items() if hl]
+        sentiment_universe = sorted(set(with_news) | set(screen_survivors)
+                                    | set(active) | set(held))
+        headlines = {t: headlines.get(t, []) for t in sentiment_universe}
+        use_llm = not args.no_llm
+        if use_llm:
+            print(f"Scoring sentiment for {len(headlines)} tickers via Claude CLI "
+                  f"(cached per {run_slot} run)...")
+
     sentiments = sentiment.score_tickers(conn, sentiment_key, headlines, warnings, use_llm)
     llm_sources = {s["source"] for s in sentiments.values()}
     if not sentiments:
         llm_status = "no tickers"
+    elif args.skip_news:
+        llm_status = "cached (news skipped)"
     elif llm_sources == {"neutral_fallback"} and use_llm:
         llm_status = "FALLBACK (neutral)"
     elif "claude_cli" in llm_sources:
@@ -130,19 +155,56 @@ def main() -> int:
     paper_exits = paper.close_positions_for_exits(conn, closed, run_date,
                                                   run_slot, warnings)
 
+    # ----------------------------------------------------------- strategy fleet
+    # Retire underperforming/stalled TECHNICAL & PULLBACK variants (backfilling
+    # immediately), add a weekly wildcard slot, flag graduate candidates, and
+    # compute today's per-strategy capital weights + market context.
+    print("Evaluating strategy fleet...")
+    strategy_ledger = strategy_engine.evaluate_and_evolve(
+        conn, run_date, run_slot, sentiments, warnings, use_llm=use_llm)
+    for event in strategy_ledger["events"]:
+        if event["type"] == "retired":
+            print(f"  Retired {event['variant_key']}: {event['reason']}")
+        elif event["type"] == "created":
+            print(f"  Created {event['variant_key']} (replacing {event['parent']})")
+        elif event["type"] == "wildcard_created":
+            print(f"  Wildcard variant {event['variant_key']} added")
+        elif event["type"] == "graduate_candidate":
+            print(f"  {event['variant_key']} flagged as a graduate candidate")
+
     # ------------------------------------------------------------- new picks
     # Channel B first (news is the primary channel), then A, then C (pullback).
+    n_tech = len(strategy_ledger["active_by_channel"]["TECHNICAL"])
+    n_pullback = len(strategy_ledger["active_by_channel"]["PULLBACK"])
     print("Scanning for news-catalyst picks (Channel B)...")
     news_picks = signals.scan_news_picks(conn, snapshots, sentiments, run_date, warnings)
-    print("Scanning for technical picks (Channel A)...")
+    print(f"Scanning for technical picks (Channel A, {n_tech} active variant(s))...")
     tech_picks = signals.scan_new_picks(conn, snapshots, sentiments, run_date,
                                         warnings, args.top)
-    print("Scanning for pullback picks (Channel C)...")
+    print(f"Scanning for pullback picks (Channel C, {n_pullback} active variant(s))...")
     pullback_picks = signals.scan_pullback_picks(conn, snapshots, sentiments,
                                                  run_date, warnings)
-    new_picks = news_picks + tech_picks + pullback_picks
-    paper_entries = paper.open_positions_for_picks(conn, new_picks, snapshots,
-                                                   run_date, run_slot, warnings)
+
+    # Six SMC/volume-concept channels — all daily-bar proxies (see
+    # stockbot/indicators.py), each evaluated against its own active fleet.
+    smc_channel_scans = [
+        ("ORDERFLOW", "order flow", signals.scan_orderflow_picks),
+        ("LIQUIDITY_SWEEP", "liquidity sweep", signals.scan_liquidity_sweep_picks),
+        ("FVG", "fair value gap", signals.scan_fvg_picks),
+        ("ANCHORED_VWAP", "anchored VWAP", signals.scan_anchored_vwap_picks),
+        ("VOLUME_PROFILE", "volume profile", signals.scan_volume_profile_picks),
+        ("BREAKOUT_52W", "52-week breakout", signals.scan_breakout_52w_picks),
+    ]
+    smc_picks: list[dict] = []
+    for channel, label, scan_fn in smc_channel_scans:
+        n_variants = len(strategy_ledger["active_by_channel"][channel])
+        print(f"Scanning for {label} picks ({channel}, {n_variants} active variant(s))...")
+        smc_picks += scan_fn(conn, snapshots, sentiments, run_date, warnings)
+
+    new_picks = news_picks + tech_picks + pullback_picks + smc_picks
+    paper_entries = paper.open_positions_for_picks(
+        conn, new_picks, snapshots, run_date, run_slot, warnings,
+        capital_weights=strategy_ledger["capital_weights"])
     # mirror paper orders into OpenAlgo's sandbox UI (SELLs first, then BUYs;
     # hard-gated on analyzer mode so nothing can reach the real broker)
     mirrored = broker.mirror_paper_orders(paper_exits + paper_entries, warnings)
@@ -207,8 +269,12 @@ def main() -> int:
         )
 
     # --------------------------------------------------------------- discord
+    has_activity = discord_alerts.has_reportable_activity(
+        closed, new_picks, paper_entries, paper_exits, strategy_ledger["events"])
     if args.no_discord:
         discord_status = "skipped (--no-discord)"
+    elif args.skip_news and not has_activity:
+        discord_status = "skipped (quiet - no activity)"
     else:
         print("Sending Discord alerts...")
         if holdings_sync["source"] == "OPENALGO":
@@ -222,7 +288,7 @@ def main() -> int:
         discord_status = discord_alerts.send_report(
             run_date, closed, new_picks, active_rows, holdings_report, stats, warnings,
             paper_entries=paper_entries, paper_exits=paper_exits, paper_book=paper_book,
-            holdings_note=holdings_note)
+            holdings_note=holdings_note, strategy_ledger=strategy_ledger)
 
     # -------------------------------------------------------------- dashboard
     dashboard.render(

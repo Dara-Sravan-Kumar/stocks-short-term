@@ -1,4 +1,10 @@
-"""Technical indicators & pivot levels — pure pandas/numpy, no TA-Lib."""
+"""Technical indicators & pivot levels — pure pandas/numpy, no TA-Lib.
+
+Some fields (cmf, fvg_bull_*, anchored_vwap, volume_poc) are DAILY-BAR PROXIES for
+concepts that normally need intraday/tick data (order flow, fair value gaps, anchored
+VWAP, volume profile) — they're documented approximations retail swing traders already
+use when tick data isn't available, not attempts to fake real intraday indicators.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -30,6 +36,17 @@ class Snapshot:
     vol_ratio: float                 # today's volume / 20d avg volume
     avg_turnover_20d: float          # 20d avg of close*volume (INR) — liquidity
     swing_low_10d: float
+    swing_low_10d_prior: float       # 10-bar low EXCLUDING today (vs swing_low_10d, which includes it)
+    close_prev: float                # prior bar's close
+    # daily-bar proxies for concepts that normally need intraday data — see
+    # indicators.py module docstring for what each one actually measures
+    cmf: float                       # Chaikin Money Flow (20d) — order-flow proxy
+    cmf_prev: float                  # CMF 5 bars ago, for a "rising" check
+    fvg_bull_bottom: float | None    # most recent unfilled bullish FVG zone (None if none)
+    fvg_bull_top: float | None
+    anchored_vwap: float             # VWAP anchored to the most recent 60-bar swing low
+    volume_poc: float                # 60-bar volume-weighted price histogram peak
+    high_252d: float                 # 252-day (52-week) rolling high
     # daily pivots (from prior day's H/L/C)
     pivot: float
     r1: float
@@ -74,6 +91,66 @@ def classic_pivots(h: float, l: float, c: float) -> dict[str, float]:
     }
 
 
+def chaikin_money_flow(close: pd.Series, high: pd.Series, low: pd.Series,
+                       volume: pd.Series, period: int = 20) -> pd.Series:
+    """Order-flow proxy: buying/selling pressure from where each bar's close sits
+    within its high-low range, weighted by volume. Not real order flow (that needs
+    tick/bid-ask data) — a standard daily-bar approximation (Chaikin Money Flow)."""
+    mf_mult = ((close - low) - (high - close)) / (high - low).replace(0, np.nan)
+    mf_vol = mf_mult * volume
+    return (mf_vol.rolling(period).sum() / volume.rolling(period).sum()).fillna(0.0)
+
+
+def find_bullish_fvg(high: pd.Series, low: pd.Series,
+                     lookback: int = 15) -> tuple[float | None, float | None]:
+    """Most recent 3-candle bullish Fair Value Gap (high[i-2] < low[i]) within the
+    lookback window. Returns (gap_bottom, gap_top), or (None, None) if none found.
+
+    Simplification: doesn't track whether the gap has since been fully traded
+    through ("filled") — the entry gate's own "price is tagging the zone today"
+    check is what actually matters for a retest signal.
+    """
+    n = len(high)
+    start = max(2, n - lookback)
+    for i in range(n - 1, start - 1, -1):
+        gap_bottom, gap_top = float(high.iloc[i - 2]), float(low.iloc[i])
+        if gap_bottom < gap_top:
+            return gap_bottom, gap_top
+    return None, None
+
+
+def anchored_vwap(df: pd.DataFrame, lookback: int = 60) -> float:
+    """VWAP anchored to the lowest-low bar in the lookback window (an objective,
+    reproducible anchor point) through today — a daily-bar approximation of
+    anchored VWAP, which normally anchors to an intraday event."""
+    window = df.iloc[-lookback:] if len(df) >= lookback else df
+    anchor_pos = df.index.get_loc(window["Low"].idxmin())
+    segment = df.iloc[anchor_pos:]
+    typical = (segment["High"] + segment["Low"] + segment["Close"]) / 3
+    cum_vol = float(segment["Volume"].sum())
+    if cum_vol <= 0:
+        return float(segment["Close"].iloc[-1])
+    return float((typical * segment["Volume"]).sum() / cum_vol)
+
+
+def volume_poc(df: pd.DataFrame, lookback: int = 60, bins: int = 20) -> float:
+    """Point-of-Control proxy: the price bin with the most volume over the lookback
+    window, from a volume-weighted histogram of typical price. Built from daily
+    bars (one volume figure per day), not real intraday volume-at-price."""
+    window = df.iloc[-lookback:] if len(df) >= lookback else df
+    typical = (window["High"] + window["Low"] + window["Close"]) / 3
+    vol = window["Volume"].to_numpy()
+    lo, hi = float(typical.min()), float(typical.max())
+    if hi <= lo:
+        return float(typical.iloc[-1])
+    edges = np.linspace(lo, hi, bins + 1)
+    bin_idx = np.clip(np.digitize(typical.to_numpy(), edges) - 1, 0, bins - 1)
+    vol_by_bin = np.zeros(bins)
+    np.add.at(vol_by_bin, bin_idx, vol)
+    poc_bin = int(np.argmax(vol_by_bin))
+    return float((edges[poc_bin] + edges[poc_bin + 1]) / 2)
+
+
 def compute_snapshot(ticker: str, df: pd.DataFrame, cross_lookback: int = 3) -> Snapshot:
     """Compute the latest-bar snapshot. df must have >= 60 daily bars."""
     close, high, low, vol = df["Close"], df["High"], df["Low"], df["Volume"]
@@ -116,6 +193,9 @@ def compute_snapshot(ticker: str, df: pd.DataFrame, cross_lookback: int = 3) -> 
     vol_ratio = float(vol.iloc[-1]) / avg_vol20 if avg_vol20 > 0 else 0.0
     avg_turnover = float((close * vol).rolling(20).mean().iloc[-1])
 
+    cmf_series = chaikin_money_flow(close, high, low, vol)
+    fvg_bottom, fvg_top = find_bullish_fvg(high, low)
+
     return Snapshot(
         ticker=ticker,
         date=df.index[-1].strftime("%Y-%m-%d"),
@@ -137,6 +217,15 @@ def compute_snapshot(ticker: str, df: pd.DataFrame, cross_lookback: int = 3) -> 
         vol_ratio=vol_ratio,
         avg_turnover_20d=avg_turnover,
         swing_low_10d=float(low.iloc[-10:].min()),
+        swing_low_10d_prior=float(low.iloc[-11:-1].min()),
+        close_prev=float(close.iloc[-2]),
+        cmf=float(cmf_series.iloc[-1]),
+        cmf_prev=float(cmf_series.iloc[-6]),
+        fvg_bull_bottom=fvg_bottom,
+        fvg_bull_top=fvg_top,
+        anchored_vwap=anchored_vwap(df),
+        volume_poc=volume_poc(df),
+        high_252d=float(high.rolling(252, min_periods=1).max().iloc[-1]),
         **piv,
         weekly_r1=weekly_r1,
         weekly_r2=weekly_r2,

@@ -161,6 +161,43 @@ CREATE TABLE IF NOT EXISTS broker_sync_log (
   holdings_count INTEGER,
   error TEXT
 );
+
+CREATE TABLE IF NOT EXISTS strategies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel TEXT NOT NULL,                    -- TECHNICAL / PULLBACK / NEWS
+  variant_key TEXT NOT NULL UNIQUE,         -- e.g. TECHNICAL_seed, PULLBACK_v2, NEWS
+  params_json TEXT,                         -- JSON param overrides; NULL = channel defaults
+  status TEXT NOT NULL DEFAULT 'ACTIVE',    -- ACTIVE / RETIRED
+  graduate_candidate INTEGER NOT NULL DEFAULT 0,
+  retirable INTEGER NOT NULL DEFAULT 1,     -- NEWS = 0, permanent, never retired
+  origin TEXT NOT NULL DEFAULT 'seed',      -- seed / llm_parameter_variant / llm_wildcard
+  parent_variant_key TEXT,
+  generation_rationale TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  retired_at TEXT,
+  retired_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS strategy_daily_context (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  date TEXT NOT NULL,
+  run_slot TEXT NOT NULL,
+  nifty_close REAL,
+  nifty_regime TEXT,          -- UPTREND / DOWNTREND / SIDEWAYS
+  nifty_return_pct REAL,
+  india_vix REAL,
+  vix_regime TEXT,            -- LOW / NORMAL / HIGH
+  avg_market_sentiment REAL,
+  banknifty_close REAL,
+  banknifty_return_pct REAL,
+  banknifty_regime TEXT,
+  sp500_return_pct REAL,      -- "global market sentiment" proxy: prior US session return
+  nasdaq_return_pct REAL,
+  nifty_crash INTEGER,        -- 0/1 booleans, single-day return <= MARKET_CRASH_THRESHOLD_PCT
+  banknifty_crash INTEGER,
+  global_crash INTEGER,       -- both S&P500 and Nasdaq <= GLOBAL_CRASH_THRESHOLD_PCT
+  UNIQUE(date, run_slot)
+);
 """
 
 
@@ -184,6 +221,60 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "source" not in cols:
         conn.execute("ALTER TABLE holdings ADD COLUMN source TEXT NOT NULL DEFAULT 'MOCK'")
         conn.execute("ALTER TABLE holdings ADD COLUMN synced_at TEXT")
+        conn.commit()
+
+    # Seed the strategy registry once per channel: today's fixed TECHNICAL/
+    # PULLBACK behavior becomes the "seed" variant, NEWS gets a permanent
+    # non-retirable row so capital weighting spans all live strategies
+    # uniformly. Checked per-channel (not just "table empty") so adding new
+    # channels later — e.g. the six SMC/volume channels — seeds only the
+    # missing ones without touching existing TECHNICAL/PULLBACK/NEWS rows.
+    seed_rows = [
+        ("TECHNICAL", "TECHNICAL_seed", 1),
+        ("PULLBACK", "PULLBACK_seed", 1),
+        ("NEWS", "NEWS", 0),
+        ("ORDERFLOW", "ORDERFLOW_seed", 1),
+        ("LIQUIDITY_SWEEP", "LIQUIDITY_SWEEP_seed", 1),
+        ("FVG", "FVG_seed", 1),
+        ("ANCHORED_VWAP", "ANCHORED_VWAP_seed", 1),
+        ("VOLUME_PROFILE", "VOLUME_PROFILE_seed", 1),
+        ("BREAKOUT_52W", "BREAKOUT_52W_seed", 1),
+    ]
+    existing_channels = {r["channel"] for r in conn.execute("SELECT DISTINCT channel FROM strategies")}
+    missing = [(ch, key, retirable) for ch, key, retirable in seed_rows if ch not in existing_channels]
+    if missing:
+        conn.executemany(
+            "INSERT INTO strategies (channel, variant_key, params_json, retirable, origin) "
+            "VALUES (?,?,NULL,?,'seed')",
+            [(ch, key, retirable) for ch, key, retirable in missing],
+        )
+        conn.commit()
+
+    # Additive columns for strategy_daily_context (databases created before the
+    # global-markets/crash-flag expansion) — same PRAGMA/ALTER pattern as above.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(strategy_daily_context)")}
+    new_context_cols = {
+        "nifty_return_pct": "REAL", "banknifty_close": "REAL",
+        "banknifty_return_pct": "REAL", "banknifty_regime": "TEXT",
+        "sp500_return_pct": "REAL", "nasdaq_return_pct": "REAL",
+        "nifty_crash": "INTEGER", "banknifty_crash": "INTEGER", "global_crash": "INTEGER",
+    }
+    for col, col_type in new_context_cols.items():
+        if col not in cols:
+            conn.execute(f"ALTER TABLE strategy_daily_context ADD COLUMN {col} {col_type}")
+    conn.commit()
+
+    # One-time paper book top-up: raising PAPER_STARTING_CASH preserves existing
+    # trade history rather than resetting it — bump both starting_cash and cash
+    # by the delta, exactly once (idempotent: no-op once starting_cash catches up).
+    book = conn.execute("SELECT starting_cash FROM paper_book WHERE id = 1").fetchone()
+    if book is not None and book["starting_cash"] < config.PAPER_STARTING_CASH:
+        delta = config.PAPER_STARTING_CASH - book["starting_cash"]
+        conn.execute(
+            "UPDATE paper_book SET starting_cash = ?, cash = cash + ?, "
+            "updated_at = datetime('now') WHERE id = 1",
+            (config.PAPER_STARTING_CASH, delta),
+        )
         conn.commit()
 
 
@@ -276,6 +367,13 @@ def get_todays_new_picks(conn: sqlite3.Connection, date: str) -> list[sqlite3.Ro
     ).fetchall()
 
 
+def get_recent_closed_picks(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM picks WHERE status != 'ACTIVE' ORDER BY exit_date DESC, id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
 # ---------------------------------------------------------------------------
 # Sentiment cache
 # ---------------------------------------------------------------------------
@@ -355,6 +453,10 @@ def log_run(conn: sqlite3.Connection, run_date: str, started_at: str, finished_a
          "; ".join(warnings) if warnings else None),
     )
     conn.commit()
+
+
+def get_last_run(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM run_log ORDER BY id DESC LIMIT 1").fetchone()
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +601,146 @@ def get_realized_pnl_cum(conn: sqlite3.Connection) -> float:
         "SELECT COALESCE(SUM(realized_pnl), 0.0) FROM paper_positions WHERE status='CLOSED'"
     ).fetchone()
     return float(row[0])
+
+
+def get_latest_equity_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM paper_equity_log ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def get_equity_curve(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM paper_equity_log ORDER BY date, run_slot").fetchall()
+
+
+def get_recent_closed_paper_positions(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM paper_positions WHERE status='CLOSED' "
+        "ORDER BY exit_date DESC, id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Strategy engine (fleets of parameter variants for TECHNICAL & PULLBACK)
+# ---------------------------------------------------------------------------
+
+def get_active_strategies(conn: sqlite3.Connection, channel: str | None = None) -> list[sqlite3.Row]:
+    if channel:
+        return conn.execute(
+            "SELECT * FROM strategies WHERE status='ACTIVE' AND channel=? ORDER BY id",
+            (channel,),
+        ).fetchall()
+    return conn.execute("SELECT * FROM strategies WHERE status='ACTIVE' ORDER BY id").fetchall()
+
+
+def get_all_strategies(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM strategies ORDER BY channel, id").fetchall()
+
+
+def insert_strategy(conn: sqlite3.Connection, strategy: dict) -> int:
+    cols = ("channel variant_key params_json retirable origin "
+            "parent_variant_key generation_rationale").split()
+    cur = conn.execute(
+        f"INSERT INTO strategies ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+        [strategy.get(c) for c in cols],
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def retire_strategy(conn: sqlite3.Connection, variant_key: str, reason: str, date: str) -> None:
+    conn.execute(
+        "UPDATE strategies SET status='RETIRED', retired_at=?, retired_reason=? "
+        "WHERE variant_key=?",
+        (date, reason, variant_key),
+    )
+    conn.commit()
+
+
+def set_graduate_candidate(conn: sqlite3.Connection, variant_key: str, is_candidate: bool) -> None:
+    conn.execute(
+        "UPDATE strategies SET graduate_candidate=? WHERE variant_key=?",
+        (int(is_candidate), variant_key),
+    )
+    conn.commit()
+
+
+def upsert_strategy_daily_context(conn: sqlite3.Connection, date: str, run_slot: str,
+                                  context: dict, avg_market_sentiment: float | None) -> None:
+    """context is market_regime.fetch_regime()'s return dict; avg_market_sentiment
+    is derived separately (from that run's scored tickers) in strategy_engine.py."""
+    fields = {
+        "nifty_close": context.get("nifty_close"),
+        "nifty_regime": context.get("nifty_regime"),
+        "nifty_return_pct": context.get("nifty_return_pct"),
+        "india_vix": context.get("india_vix"),
+        "vix_regime": context.get("vix_regime"),
+        "avg_market_sentiment": avg_market_sentiment,
+        "banknifty_close": context.get("banknifty_close"),
+        "banknifty_return_pct": context.get("banknifty_return_pct"),
+        "banknifty_regime": context.get("banknifty_regime"),
+        "sp500_return_pct": context.get("sp500_return_pct"),
+        "nasdaq_return_pct": context.get("nasdaq_return_pct"),
+        "nifty_crash": context.get("nifty_crash"),
+        "banknifty_crash": context.get("banknifty_crash"),
+        "global_crash": context.get("global_crash"),
+    }
+    for key in ("nifty_crash", "banknifty_crash", "global_crash"):
+        if fields[key] is not None:
+            fields[key] = int(fields[key])  # SQLite has no native bool - store 0/1/NULL
+
+    cols = list(fields.keys())
+    updates = ",".join(f"{c}=excluded.{c}" for c in cols)
+    conn.execute(
+        f"""INSERT INTO strategy_daily_context (date, run_slot, {','.join(cols)})
+            VALUES (?,?,{','.join('?' * len(cols))})
+            ON CONFLICT(date, run_slot) DO UPDATE SET {updates}""",
+        (date, run_slot, *(fields[c] for c in cols)),
+    )
+    conn.commit()
+
+
+def get_strategy_ledger_stats(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Per-variant closed-trade performance: trades, win rate, profit factor, pnl.
+
+    Keyed by paper_positions.strategy, which now holds the variant_key (e.g.
+    "TECHNICAL_v2") rather than the flat channel name — GROUP BY works unmodified
+    since strategy is a free-text column.
+    """
+    rows = conn.execute(
+        """SELECT strategy,
+                  COUNT(*) AS closed,
+                  SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                  SUM(CASE WHEN realized_pnl > 0 THEN realized_pnl ELSE 0 END) AS gross_profit,
+                  SUM(CASE WHEN realized_pnl <= 0 THEN -realized_pnl ELSE 0 END) AS gross_loss,
+                  SUM(realized_pnl) AS realized_pnl
+           FROM paper_positions WHERE status='CLOSED' GROUP BY strategy"""
+    ).fetchall()
+    stats = {}
+    for r in rows:
+        closed = r["closed"]
+        gross_loss = r["gross_loss"] or 0.0
+        gross_profit = r["gross_profit"] or 0.0
+        stats[r["strategy"]] = {
+            "closed": closed,
+            "wins": r["wins"] or 0,
+            "win_rate": (r["wins"] or 0) / closed * 100 if closed else 0.0,
+            "realized_pnl": r["realized_pnl"] or 0.0,
+            # None = no losing trades yet (undefined ratio, not a bad signal)
+            "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else None,
+        }
+    return stats
+
+
+def get_deployed_capital_by_strategy(conn: sqlite3.Connection) -> dict[str, float]:
+    rows = conn.execute(
+        "SELECT strategy, SUM(cost_basis) AS deployed FROM paper_positions "
+        "WHERE status='OPEN' GROUP BY strategy"
+    ).fetchall()
+    return {r["strategy"]: r["deployed"] or 0.0 for r in rows}
+
+
+def get_latest_market_context(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM strategy_daily_context ORDER BY id DESC LIMIT 1").fetchone()
 
 
 # ---------------------------------------------------------------------------
