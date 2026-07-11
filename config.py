@@ -411,6 +411,15 @@ FYERS_HISTORY_DAYS = 360       # <= 366-day per-request limit on daily candles
 FYERS_MAX_WORKERS = 4          # parallel history fetchers
 FYERS_MIN_CALL_GAP = 0.35      # seconds between request starts (~170/min,
                                # under Fyers' 200/min data-API rate limit)
+FYERS_QUOTE_BATCH = 50         # symbols per /data/quotes call (Fyers max)
+
+# ---------------------------------------------------------------------------
+# Trading mode. "PAPER" (default): virtual book only, no real orders ever.
+# "LIVE": run_daily mirrors every paper entry/exit into a REAL Fyers order —
+# but only if PLACE_ORDER_ENABLED below is also True. Both gates must be
+# flipped deliberately; either one alone keeps real money untouched.
+# ---------------------------------------------------------------------------
+TRADING_MODE = os.getenv("TRADING_MODE", "PAPER").strip().upper()
 
 
 def fyers_settings() -> dict:
@@ -432,7 +441,9 @@ def fyers_settings() -> dict:
 OPENALGO_TIMEOUT = 15            # seconds per REST call
 HOLDINGS_STALE_HOURS = 30        # warn when the last broker sync is older
 BROKER_SYMBOL_OVERRIDES = {}     # OpenAlgo symbol -> yfinance ticker exceptions
-PLACE_ORDER_ENABLED = False      # hard gate: real order placement is OFF in v1
+PLACE_ORDER_ENABLED = False      # hard gate: real order placement is OFF.
+                                 # Live orders need BOTH this True AND
+                                 # TRADING_MODE=LIVE in .env (see above).
 
 # Mirror paper BUY/SELL orders into OpenAlgo's Analyzer (sandbox) so they show
 # up in its trading UI. Safety: mirroring only happens when OpenAlgo confirms

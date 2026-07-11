@@ -264,6 +264,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE strategy_daily_context ADD COLUMN {col} {col_type}")
     conn.commit()
 
+    # Live-order audit trail (TRADING_MODE=LIVE). Every real-order attempt is
+    # recorded here — SUBMITTED, BLOCKED (gate off), or FAILED — so the
+    # dashboard's Live mode can show exactly what would have / did happen.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS live_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            date TEXT NOT NULL,
+            run_slot TEXT,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+            qty INTEGER NOT NULL,
+            strategy TEXT,
+            status TEXT NOT NULL CHECK (status IN ('SUBMITTED', 'BLOCKED', 'FAILED')),
+            order_id TEXT,
+            detail TEXT
+        )""")
+    conn.commit()
+
     # One-time paper book top-up: raising PAPER_STARTING_CASH preserves existing
     # trade history rather than resetting it — bump both starting_cash and cash
     # by the delta, exactly once (idempotent: no-op once starting_cash catches up).
@@ -777,3 +796,26 @@ def log_broker_sync(conn: sqlite3.Connection, synced_at: str, source: str,
         (synced_at, source, status, holdings_count, error),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Live trades (TRADING_MODE=LIVE audit trail)
+# ---------------------------------------------------------------------------
+
+def log_live_trade(conn: sqlite3.Connection, ts: str, date: str, run_slot: str | None,
+                   ticker: str, side: str, qty: int, strategy: str | None,
+                   status: str, order_id: str | None = None,
+                   detail: str | None = None) -> None:
+    conn.execute(
+        """INSERT INTO live_trades (ts, date, run_slot, ticker, side, qty,
+                                    strategy, status, order_id, detail)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (ts, date, run_slot, ticker, side, qty, strategy, status, order_id, detail),
+    )
+    conn.commit()
+
+
+def get_live_trades(conn: sqlite3.Connection, limit: int = 500) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM live_trades ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()

@@ -226,6 +226,65 @@ def _fetch_candles(symbol: str, app_id: str, token: str,
         return None
 
 
+def fetch_quotes(tickers: list[str], warnings: list[str]) -> dict[str, dict]:
+    """Live LTPs: {ticker: {ltp, change_pct, open, high, low, prev_close,
+    volume}}. Batched through /data/quotes; any failure is a warning and the
+    affected tickers are simply absent from the result."""
+    creds = config.fyers_settings()
+    if not creds["app_id"] or not creds["secret_id"]:
+        return {}
+    token = ensure_token(creds, warnings)
+    if token is None:
+        return {}
+    symbols = resolve_symbols(sorted(set(tickers)), warnings)
+    if not symbols:
+        return {}
+    by_symbol = {v: k for k, v in symbols.items()}
+    throttle = _Throttle(config.FYERS_MIN_CALL_GAP)
+
+    out: dict[str, dict] = {}
+    syms = list(symbols.values())
+    for i in range(0, len(syms), config.FYERS_QUOTE_BATCH):
+        chunk = ",".join(syms[i:i + config.FYERS_QUOTE_BATCH])
+        throttle.wait()
+        try:
+            resp = requests.get(f"{config.FYERS_DATA_BASE}/quotes",
+                                params={"symbols": chunk},
+                                headers={"Authorization": f"{creds['app_id']}:{token}"},
+                                timeout=config.FYERS_TIMEOUT)
+            if resp.status_code == 401:
+                token = ensure_token(creds, warnings, force_refresh=True)
+                if token is None:
+                    return out
+                resp = requests.get(f"{config.FYERS_DATA_BASE}/quotes",
+                                    params={"symbols": chunk},
+                                    headers={"Authorization": f"{creds['app_id']}:{token}"},
+                                    timeout=config.FYERS_TIMEOUT)
+            data = resp.json()
+            if resp.status_code >= 400 or data.get("s") != "ok":
+                warnings.append(f"Fyers quotes HTTP {resp.status_code}: "
+                                f"{str(data.get('message', ''))[:120]}")
+                continue
+        except Exception as exc:
+            warnings.append(f"Fyers quotes fetch failed ({exc})")
+            continue
+        for item in data.get("d") or []:
+            ticker = by_symbol.get(item.get("n"))
+            values = item.get("v") or {}
+            if not ticker or not values.get("lp"):
+                continue
+            out[ticker] = {
+                "ltp": float(values["lp"]),
+                "change_pct": values.get("chp"),
+                "open": values.get("open_price"),
+                "high": values.get("high_price"),
+                "low": values.get("low_price"),
+                "prev_close": values.get("prev_close_price"),
+                "volume": values.get("volume"),
+            }
+    return out
+
+
 def fetch_history(tickers: list[str],
                   warnings: list[str]) -> dict[str, pd.DataFrame]:
     """{ticker: DataFrame[Open, High, Low, Close, Volume]} of daily NSE bars."""

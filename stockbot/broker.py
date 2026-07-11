@@ -231,8 +231,91 @@ def mirror_paper_orders(actions: list[dict], warnings: list[str]) -> int:
     return mirrored
 
 
+def place_order_fyers(ticker: str, side: str, qty: int,
+                      warnings: list[str]) -> dict | None:
+    """Place a REAL market order (CNC delivery) on Fyers. Returns the API
+    payload on success, None on any failure. Callers are responsible for the
+    TRADING_MODE / PLACE_ORDER_ENABLED gates — this function only trades.
+    """
+    creds = config.fyers_settings()
+    if not creds["app_id"] or not creds["secret_id"]:
+        warnings.append("Fyers order blocked: FYERS_APP_ID/SECRET_ID not set")
+        return None
+    token = fyers_data.ensure_token(creds, warnings)
+    if token is None:
+        return None
+    symbols = fyers_data.resolve_symbols([ticker], warnings)
+    symbol = symbols.get(ticker)
+    if not symbol:
+        return None
+    body = {
+        "symbol": symbol, "qty": int(qty),
+        "type": 2,                              # market order
+        "side": 1 if side.upper() == "BUY" else -1,
+        "productType": "CNC", "validity": "DAY",
+        "limitPrice": 0, "stopPrice": 0,
+        "disclosedQty": 0, "offlineOrder": False,
+    }
+    try:
+        resp = requests.post(f"{config.FYERS_API_BASE}/orders/sync", json=body,
+                             headers={"Authorization": f"{creds['app_id']}:{token}"},
+                             timeout=config.FYERS_TIMEOUT)
+        payload = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        warnings.append(f"Fyers order {side} {ticker} failed: {exc}")
+        return None
+    if resp.status_code >= 400 or payload.get("s") != "ok":
+        warnings.append(f"Fyers order {side} {ticker} rejected: "
+                        f"{str(payload.get('message', payload))[:150]}")
+        return None
+    return payload
+
+
+def execute_live_orders(conn: sqlite3.Connection, actions: list[dict],
+                        run_date: str, run_slot: str,
+                        warnings: list[str]) -> dict:
+    """Mirror paper BUY/SELL actions into REAL Fyers orders when — and only
+    when — TRADING_MODE=LIVE. Second gate: with PLACE_ORDER_ENABLED still
+    False, every order is recorded as BLOCKED in live_trades (visible in the
+    dashboard's Live mode) but nothing is sent. In PAPER mode this is a
+    complete no-op. Returns {submitted, blocked, failed}.
+    """
+    result = {"submitted": 0, "blocked": 0, "failed": 0}
+    orders = [a for a in actions if a.get("action") in ("BUY", "SELL")]
+    if config.TRADING_MODE != "LIVE" or not orders:
+        return result
+
+    if not config.PLACE_ORDER_ENABLED:
+        for a in orders:
+            db.log_live_trade(
+                conn, datetime.now().isoformat(timespec="seconds"), run_date,
+                run_slot, a["ticker"], a["action"], a["qty"], a.get("strategy"),
+                "BLOCKED", detail="PLACE_ORDER_ENABLED is False")
+        result["blocked"] = len(orders)
+        warnings.append(f"TRADING_MODE=LIVE but PLACE_ORDER_ENABLED is False - "
+                        f"{len(orders)} real order(s) blocked (recorded in live_trades)")
+        return result
+
+    for a in orders:  # actions arrive exits-first, so SELLs free cash for BUYs
+        payload = place_order_fyers(a["ticker"], a["action"], a["qty"], warnings)
+        now = datetime.now().isoformat(timespec="seconds")
+        if payload is not None:
+            db.log_live_trade(conn, now, run_date, run_slot, a["ticker"],
+                              a["action"], a["qty"], a.get("strategy"),
+                              "SUBMITTED", order_id=str(payload.get("id", "")),
+                              detail=str(payload.get("message", ""))[:150])
+            result["submitted"] += 1
+        else:
+            db.log_live_trade(conn, now, run_date, run_slot, a["ticker"],
+                              a["action"], a["qty"], a.get("strategy"),
+                              "FAILED", detail=warnings[-1][:150] if warnings else None)
+            result["failed"] += 1
+    return result
+
+
 def place_order(ticker: str, side: str, qty: int, warnings: list[str]) -> dict | None:
-    """Future automation hook — hard-disabled in v1 (config.PLACE_ORDER_ENABLED).
+    """Legacy OpenAlgo order hook — hard-disabled (config.PLACE_ORDER_ENABLED).
+    Real order placement now goes through place_order_fyers/execute_live_orders.
 
     When enabled, posts to OpenAlgo /api/v1/placeorder which routes to the
     connected broker (IndMoney). Paper trading never calls this.

@@ -221,6 +221,18 @@ def main() -> int:
     if mirrored:
         print(f"Mirrored {mirrored} paper order(s) to OpenAlgo sandbox")
 
+    # LIVE mode: mirror paper actions into real Fyers orders. No-op unless
+    # TRADING_MODE=LIVE in .env; even then PLACE_ORDER_ENABLED must also be
+    # True or every order is merely recorded as BLOCKED in live_trades.
+    live = broker.execute_live_orders(conn, paper_exits + paper_entries,
+                                      run_date, run_slot, warnings)
+    if live["submitted"] or live["failed"]:
+        print(f"LIVE orders (Fyers): {live['submitted']} submitted, "
+              f"{live['failed']} failed")
+    elif live["blocked"]:
+        print(f"LIVE mode: {live['blocked']} order(s) blocked - "
+              "PLACE_ORDER_ENABLED is False")
+
     # -------------------------------------------------------- active overview
     active_rows = []
     for p in db.get_active_picks(conn):
