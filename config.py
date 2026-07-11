@@ -214,9 +214,15 @@ CLAUDE_CLI_TIMEOUT = 300       # seconds per batched call
 # Paper trading — one shared virtual book, positions tagged by strategy
 # ---------------------------------------------------------------------------
 PAPER_STRATEGIES = ["TECHNICAL", "NEWS", "PULLBACK"]
-PAPER_STARTING_CASH = 100_000.0  # INR, single shared cash pool
-PAPER_RISK_PCT_PER_TRADE = 1.5   # % of book equity risked between entry and stop
-PAPER_MAX_POSITION_PCT = 40.0    # max position value as % of book equity
+PAPER_STARTING_CASH = 500_000.0  # INR, single shared cash pool
+PAPER_RISK_PCT_PER_TRADE = 1.0   # % of book equity risked between entry and stop
+PAPER_MAX_POSITION_PCT = 2.0     # max position value as % of book equity. Kept
+                                 # deliberately small: the goal is MANY reasonable
+                                 # trades spread across every strategy variant, not
+                                 # a few large bets. At 2% of Rs 5L that's ~Rs 10k
+                                 # per position, so ~30-50 can run concurrently and
+                                 # each of the 17 variants gets enough turnover to
+                                 # build a statistically meaningful track record.
 PAPER_MIN_CASH_BUFFER = 50.0     # cash kept free for charges (INR)
 PAPER_MIN_POSITION_VALUE = 1500.0  # skip positions smaller than this: fixed
                                    # charges (~Rs 23 round trip) would eat them
@@ -314,7 +320,10 @@ STRATEGY_RETIREMENT_WIN_RATE_FLOOR = 35.0 # retire if win rate is below this AND
 STRATEGY_GRADUATE_MIN_TRADES = 50         # sample size required to flag as graduate-candidate
 STRATEGY_GRADUATE_WIN_RATE = 55.0         # win rate required to flag as graduate-candidate
 STRATEGY_MIN_CAPITAL_WEIGHT_PCT = 5.0     # floor: every active strategy gets at least this share
-STRATEGY_MAX_CAPITAL_WEIGHT_PCT = 40.0    # ceiling: no strategy dominates the shared book
+                                          # (on Rs 5L that's ~Rs 25k/variant - room for
+                                          # several concurrent ~Rs 10k positions each)
+STRATEGY_MAX_CAPITAL_WEIGHT_PCT = 12.0    # ceiling: keep allocation even so ALL variants get
+                                          # tested, rather than one strategy hogging the book
 STRATEGY_WILDCARD_INTERVAL_DAYS = 7       # cadence for an extra experimental variant
 STRATEGY_FLEET_SIZE = 3                   # fallback target fleet size (see BY_CHANNEL below)
 STRATEGY_FLEET_MAX = 6                    # fallback hard ceiling (see BY_CHANNEL below)

@@ -46,20 +46,24 @@ def test_sell_costs_include_dp_no_stamp():
 # ---------------------------------------------------------------------------
 
 def test_size_position_worked_example():
-    qty, note = paper.size_position(equity=10_000, cash=10_000,
+    # Rs 5L book, Rs 500 stock, stop 482 (Rs 18/share risk):
+    #   risk budget 1% x 500k = 5000 / 18 = 277 shares
+    #   2% position cap = 10000 / 500.25 fill = 19 shares  <- binds
+    qty, note = paper.size_position(equity=500_000, cash=500_000,
                                     entry_ref=500.0, stop=482.0)
-    # risk budget 150 / 18 per share = 8, but 40% position cap => 7
-    assert qty == 7
+    assert qty == 19
     assert "position cap" in note
 
 
 def test_size_position_risk_binding():
-    # wide book, tight stop: risk is the binding constraint
-    qty, note = paper.size_position(equity=10_000, cash=10_000,
-                                    entry_ref=100.0, stop=98.0)
-    # risk budget 150 / 2 = 75; cap 4000/100.05 = 39; cash ~ 9930/100.2 = 99
-    assert qty == 39 or "cap" in note  # cap binds at 39
-    assert qty == 39
+    # A very wide stop makes risk the binding constraint even under the small
+    # 2% position cap: entry 100, stop 40 => Rs 60/share risk.
+    #   risk budget 1% x 500k = 5000 / 60 = 83 shares      <- binds
+    #   2% position cap = 10000 / 100.05 fill = 99 shares
+    qty, note = paper.size_position(equity=500_000, cash=500_000,
+                                    entry_ref=100.0, stop=40.0)
+    assert qty == 83
+    assert "risk" in note
 
 
 def test_size_position_insufficient_cash():
@@ -80,18 +84,18 @@ def test_size_position_rejects_bad_stop():
 # ---------------------------------------------------------------------------
 
 def test_size_position_respects_budget_cap():
-    # Unconstrained, the position cap binds at 7 (see worked example above).
-    # A tight strategy budget (3 shares' worth) becomes the new binding
-    # constraint — 1600 rather than 1000 so the result still clears
-    # PAPER_MIN_POSITION_VALUE (else it would be skipped as too small, not capped).
-    qty, note = paper.size_position(equity=10_000, cash=10_000,
-                                    entry_ref=500.0, stop=482.0, budget_cap=1600.0)
-    assert qty == 3
+    # Unconstrained, the 2% position cap binds at 19 (see worked example above).
+    # A tighter strategy budget (Rs 6000, ~11 shares) becomes the new binding
+    # constraint — chosen so the result still clears PAPER_MIN_POSITION_VALUE
+    # (else it would be skipped as too small, not capped).
+    qty, note = paper.size_position(equity=500_000, cash=500_000,
+                                    entry_ref=500.0, stop=482.0, budget_cap=6000.0)
+    assert qty == 11
     assert "strategy budget" in note
 
 
 def test_size_position_budget_cap_exhausted_skips():
-    qty, note = paper.size_position(equity=10_000, cash=10_000,
+    qty, note = paper.size_position(equity=500_000, cash=500_000,
                                     entry_ref=500.0, stop=482.0, budget_cap=0.0)
     assert qty == 0
     assert "strategy budget exhausted" in note
@@ -163,20 +167,22 @@ def test_open_close_round_trip_reconciles(conn):
 
 def test_skip_when_cash_exhausted(conn):
     warnings = []
-    # exhaust the book with an affordable large position first
-    paper.open_positions_for_picks(conn, [_pick("AAA.NS")], {}, "2026-07-06",
-                                   "AM", warnings)
-    paper.open_positions_for_picks(conn, [_pick("BBB.NS")], {}, "2026-07-06",
-                                   "AM", warnings)
-    paper.open_positions_for_picks(conn, [_pick("CCC.NS")], {}, "2026-07-06",
-                                   "AM", warnings)
-    # after three ~3.5k positions, a fourth must be skipped for cash
-    actions = paper.open_positions_for_picks(conn, [_pick("DDD.NS")], {},
-                                             "2026-07-06", "AM", warnings)
-    assert actions[0]["action"] == "SKIP"
-    assert "cash" in actions[0]["note"]
+    # The Rs 5L book funds MANY small (~2%-of-equity) positions across distinct
+    # tickers, then gracefully stops once it's drained — without ever going
+    # negative. This is the "reasonable size, more trades" profile in action.
+    opened, skipped = 0, None
+    for i in range(200):
+        actions = paper.open_positions_for_picks(
+            conn, [_pick(f"T{i:03d}.NS")], {}, "2026-07-06", "AM", warnings)
+        if actions[0]["action"] == "BUY":
+            opened += 1
+        else:
+            skipped = actions[0]
+            break
+    assert opened > 10          # dozens of small positions, not a few big ones
+    assert skipped is not None  # further picks are skipped once the book drains
     book = db.get_paper_book(conn)
-    assert book["cash"] > 0  # never negative
+    assert book["cash"] > 0     # never negative
 
 
 def test_duplicate_open_position_rejected(conn):
