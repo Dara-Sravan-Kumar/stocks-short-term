@@ -1,4 +1,6 @@
-"""Batched OHLCV download via yfinance with per-ticker resilience."""
+"""Daily OHLCV for the scan universe: Fyers (real broker data) when
+configured, with the original batched yfinance download as gap-filler and
+full fallback. Failures are warnings, never exceptions."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,6 +10,7 @@ import pandas as pd
 import yfinance as yf
 
 import config
+from stockbot import fyers_data
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -17,15 +20,35 @@ def today_ist() -> str:
 
 
 def fetch_history(tickers: list[str], warnings: list[str]) -> dict[str, pd.DataFrame]:
-    """Download ~1y of daily bars for all tickers in one batched call.
+    """~1y of daily bars per ticker: Fyers first, yfinance for the rest.
 
     Returns {ticker: DataFrame[Open, High, Low, Close, Volume]} keeping only
-    tickers with enough clean history. Failures are recorded as warnings,
-    never raised.
+    tickers with enough clean history.
     """
     tickers = sorted(set(tickers))
     if not tickers:
         return {}
+    creds = config.fyers_settings()
+    if creds["app_id"] and creds["secret_id"]:
+        try:
+            out = fyers_data.fetch_history(tickers, warnings)
+        except Exception as exc:
+            warnings.append(f"Fyers provider crashed ({exc}) - using yfinance")
+            out = {}
+        if out:
+            missing = [t for t in tickers if t not in out]
+            if missing:
+                warnings.append(f"Fyers missed {len(missing)} of {len(tickers)} "
+                                "tickers - filling from yfinance")
+                out.update(_fetch_yfinance(missing, warnings))
+            return out
+        warnings.append("Fyers returned no data - falling back to yfinance")
+    return _fetch_yfinance(tickers, warnings)
+
+
+def _fetch_yfinance(tickers: list[str],
+                    warnings: list[str]) -> dict[str, pd.DataFrame]:
+    """Original one-shot batched yfinance download."""
     try:
         raw = yf.download(
             tickers,

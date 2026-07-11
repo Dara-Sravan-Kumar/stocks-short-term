@@ -133,6 +133,12 @@ MOCK_HOLDINGS = [
 HISTORY_PERIOD = "1y"          # daily bars fetched per ticker
 MIN_HISTORY_BARS = 60          # skip tickers with less history
 
+# Run window (IST). NSE trades Mon-Fri 09:15-15:30; the window is wider so the
+# 08:45 pre-open news run and the 18:30 post-close run still fire. Outside it
+# (nights/weekends) run_daily.py exits immediately unless --force is passed.
+RUN_WINDOW_OPEN = "08:30"
+RUN_WINDOW_CLOSE = "18:45"
+
 # ---------------------------------------------------------------------------
 # Entry criteria
 # ---------------------------------------------------------------------------
@@ -394,7 +400,34 @@ STRATEGY_TOGGLE_LIBRARY = [
 ]
 
 # ---------------------------------------------------------------------------
-# OpenAlgo broker bridge (holdings sync from INDmoney; creds in .env)
+# Fyers API v3 (primary broker since 2026-07-11: market data + holdings; creds
+# in .env). The app is SHARED with mcx-short-term — one active access token
+# per app, so both projects must point FYERS_TOKEN_PATH at the same file.
+# ---------------------------------------------------------------------------
+FYERS_API_BASE = "https://api-t1.fyers.in/api/v3"
+FYERS_DATA_BASE = "https://api-t1.fyers.in/data"
+FYERS_TIMEOUT = 20             # seconds per REST call
+FYERS_HISTORY_DAYS = 360       # <= 366-day per-request limit on daily candles
+FYERS_MAX_WORKERS = 4          # parallel history fetchers
+FYERS_MIN_CALL_GAP = 0.35      # seconds between request starts (~170/min,
+                               # under Fyers' 200/min data-API rate limit)
+
+
+def fyers_settings() -> dict:
+    """Read Fyers API credentials from the environment (after load_dotenv)."""
+    return {
+        "app_id": os.getenv("FYERS_APP_ID", "").strip(),
+        "secret_id": os.getenv("FYERS_SECRET_ID", "").strip(),
+        "pin": os.getenv("FYERS_PIN", "").strip(),
+        "redirect_uri": os.getenv(
+            "FYERS_REDIRECT_URI",
+            "https://trade.fyers.in/api-login/redirect-uri/index.html").strip(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# OpenAlgo broker bridge (RETIRED with INDmoney 2026-07-11 — kept only as a
+# holdings-sync fallback while creds remain in .env)
 # ---------------------------------------------------------------------------
 OPENALGO_TIMEOUT = 15            # seconds per REST call
 HOLDINGS_STALE_HOURS = 30        # warn when the last broker sync is older

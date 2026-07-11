@@ -26,7 +26,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 import config
-from stockbot import db, market_data, news, sentiment, signals, exits, portfolio
+from stockbot import db, market_calendar, market_data, news, sentiment, signals
+from stockbot import exits, portfolio
 from stockbot import dashboard, discord_alerts, paper, broker, strategy_engine
 from stockbot.indicators import compute_snapshot
 
@@ -44,9 +45,18 @@ def main() -> int:
                         help="max new picks per day")
     parser.add_argument("--refresh-universe", action="store_true",
                         help="force re-fetch of NSE index constituents")
+    parser.add_argument("--force", action="store_true",
+                        help="run even outside the weekday run window")
     args = parser.parse_args()
 
     load_dotenv(config.PROJECT_ROOT / ".env")
+
+    now = market_calendar.now_ist()
+    if not market_calendar.is_run_window(now) and not args.force:
+        print(f"Outside NSE run window ({now:%a %H:%M} IST, window "
+              f"{config.RUN_WINDOW_OPEN}-{config.RUN_WINDOW_CLOSE} Mon-Fri) - "
+              "skipping run. Use --force to run anyway.")
+        return 0
 
     started_at = datetime.now().isoformat(timespec="seconds")
     run_date = market_data.today_ist()
@@ -59,7 +69,7 @@ def main() -> int:
     if db.ensure_paper_book(conn):
         warnings.append(f"Paper book created with Rs {config.PAPER_STARTING_CASH:,.0f} "
                         "virtual cash")
-    print("Syncing holdings from broker (OpenAlgo)...")
+    print("Syncing holdings from broker (Fyers)...")
     holdings_sync = broker.sync_holdings(conn, warnings)
     print(f"Holdings: {holdings_sync['count']} positions "
           f"(source: {holdings_sync['source']}"
@@ -277,7 +287,7 @@ def main() -> int:
         discord_status = "skipped (quiet - no activity)"
     else:
         print("Sending Discord alerts...")
-        if holdings_sync["source"] == "OPENALGO":
+        if holdings_sync["source"] in ("FYERS", "OPENALGO"):
             holdings_note = f"live sync {holdings_sync['synced_at'][:16]}"
         elif holdings_sync["stale"]:
             holdings_note = "STALE SNAPSHOT - refresh IndMoney token"

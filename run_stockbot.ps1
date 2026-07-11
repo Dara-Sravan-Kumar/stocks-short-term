@@ -2,7 +2,8 @@
 # Windows Task Dashboard's Run button at http://127.0.0.1:8787/).
 # Logs each run to data\logs\run_<timestamp>.log and keeps the last 60 logs.
 #
-# -SkipNews: for the hourly in-between task ("StockBot Hourly Strategy Scan").
+# -SkipNews: for the 30-min in-between task ("StockBot Hourly Strategy Scan",
+# daily 09:30-15:30 IST, every 30 minutes).
 # Passes --skip-news through to run_daily.py — no news fetch, no fresh LLM
 # sentiment calls, Discord stays quiet unless something actually happened.
 # The twice-daily anchor task ("StockBot Daily Run") calls this with no

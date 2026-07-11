@@ -1,11 +1,10 @@
-"""OpenAlgo broker bridge — real holdings sync from INDmoney (and a future
-order-placement hook).
+"""Broker bridge — holdings sync (Fyers primary) and a future order hook.
 
-OpenAlgo (github.com/marketcalls/openalgo) runs locally and exposes a unified
-REST API over 30+ Indian brokers, including IndMoney. IndMoney's bearer token
-expires every ~24h and must be refreshed in the OpenAlgo UI, so a failed sync
-is EXPECTED daily reality: the bot then keeps the last-synced snapshot and
-flags staleness instead of failing the run.
+Since 2026-07-11 Fyers is the broker of record: holdings come straight from
+its /holdings API using the same shared token as market data. The OpenAlgo
+path below (unified REST bridge that carried INDmoney holdings before the
+move) remains only as a fallback while its creds are still in .env; a failed
+sync keeps the last snapshot and flags staleness instead of failing the run.
 """
 from __future__ import annotations
 
@@ -15,7 +14,52 @@ from datetime import datetime, timedelta
 import requests
 
 import config
-from stockbot import db
+from stockbot import db, fyers_data
+
+
+def map_fyers_symbol(symbol: str) -> str | None:
+    """'NSE:TCS-EQ' -> 'TCS.NS'. Returns None for non-NSE symbols."""
+    sym = (symbol or "").strip().upper()
+    if not sym.startswith("NSE:"):
+        return None
+    body = sym[len("NSE:"):]
+    root = body.rsplit("-", 1)[0] if "-" in body else body
+    return f"{root}.NS" if root else None
+
+
+def fetch_holdings_fyers(warnings: list[str]) -> list[dict] | None:
+    """Fetch holdings straight from Fyers. Returns None on any failure
+    (missing creds/token, HTTP or payload errors) so the caller can fall back.
+    An empty list is a VALID result — a fresh account simply holds nothing."""
+    creds = config.fyers_settings()
+    if not creds["app_id"] or not creds["secret_id"]:
+        return None
+    token = fyers_data.ensure_token(creds, warnings)
+    if token is None:
+        return None
+    try:
+        resp = requests.get(f"{config.FYERS_API_BASE}/holdings",
+                            headers={"Authorization": f"{creds['app_id']}:{token}"},
+                            timeout=config.FYERS_TIMEOUT)
+        payload = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        warnings.append(f"Fyers holdings unreachable: {exc}")
+        return None
+    if resp.status_code >= 400 or payload.get("s") != "ok":
+        warnings.append(f"Fyers holdings error: "
+                        f"{str(payload.get('message', payload))[:150]}")
+        return None
+
+    holdings = []
+    for h in payload.get("holdings") or []:
+        ticker = map_fyers_symbol(h.get("symbol", ""))
+        qty = int(h.get("quantity") or 0)
+        avg = float(h.get("costPrice") or 0.0)
+        if ticker and qty > 0 and avg > 0:
+            holdings.append({"ticker": ticker, "avg_buy_price": avg, "quantity": qty})
+        elif not ticker and h.get("symbol"):
+            warnings.append(f"Fyers holding {h['symbol']} skipped - not NSE")
+    return holdings
 
 
 def map_symbol(oa_symbol: str, exchange: str) -> str | None:
@@ -70,11 +114,20 @@ def fetch_holdings(warnings: list[str]) -> list[dict] | None:
 
 
 def sync_holdings(conn: sqlite3.Connection, warnings: list[str]) -> dict:
-    """Refresh the holdings table from OpenAlgo, degrading gracefully.
+    """Refresh the holdings table: Fyers first, OpenAlgo fallback, then the
+    last snapshot with staleness flagging.
 
     Returns {source, synced_at, stale, count} for dashboard/Discord display.
     """
     now = datetime.now().isoformat(timespec="seconds")
+
+    fyers_rows = fetch_holdings_fyers(warnings)
+    if fyers_rows is not None:
+        db.replace_holdings(conn, fyers_rows, source="FYERS", synced_at=now)
+        db.log_broker_sync(conn, now, "FYERS", "OK", len(fyers_rows), None)
+        return {"source": "FYERS", "synced_at": now, "stale": False,
+                "count": len(fyers_rows)}
+
     cfg = config.openalgo_settings()
 
     if not cfg["host"] or not cfg["api_key"]:
