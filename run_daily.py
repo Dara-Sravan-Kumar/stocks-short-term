@@ -214,7 +214,14 @@ def main() -> int:
         print(f"Scanning for {label} picks ({channel}, {n_variants} active variant(s))...")
         smc_picks += scan_fn(conn, snapshots, sentiments, run_date, warnings)
 
-    new_picks = news_picks + tech_picks + pullback_picks + smc_picks
+    # DISCOVERED: data-driven spec variants sourced by strategy_discovery (web
+    # discoverer / mixer), each carrying its own entry expression.
+    n_discovered = len(strategy_ledger["active_by_channel"].get("DISCOVERED", []))
+    print(f"Scanning for discovered-spec picks (DISCOVERED, {n_discovered} active variant(s))...")
+    discovered_picks = signals.scan_discovered_picks(conn, snapshots, sentiments,
+                                                     run_date, warnings)
+
+    new_picks = news_picks + tech_picks + pullback_picks + smc_picks + discovered_picks
     paper_entries = paper.open_positions_for_picks(
         conn, new_picks, snapshots, run_date, run_slot, warnings,
         capital_weights=strategy_ledger["capital_weights"])

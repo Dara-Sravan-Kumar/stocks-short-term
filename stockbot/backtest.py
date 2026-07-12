@@ -31,8 +31,8 @@ from stockbot.indicators import Snapshot, compute_snapshot, derive_target_stop
 from stockbot.signals import (
     _passes_anchored_vwap, _passes_breakout_52w, _passes_fvg,
     _passes_liquidity_sweep, _passes_orderflow, _passes_pullback,
-    _passes_technicals, _passes_volume_profile, _pullback_score, _rank_score,
-    build_toggle_context,
+    _passes_spec, _passes_technicals, _passes_volume_profile, _pullback_score,
+    _rank_score, build_toggle_context,
 )
 
 # (gate_fn, reward:risk params key, ranking score, daily-cap config name) per
@@ -55,6 +55,11 @@ CHANNEL_SPECS = {
                        "MAX_VOLUME_PROFILE_PICKS_PER_DAY"),
     "BREAKOUT_52W": (_passes_breakout_52w, "min_reward_risk", _rank_score,
                      "MAX_BREAKOUT_52W_PICKS_PER_DAY"),
+    # DISCOVERED variants each carry their own entry_expr in params; one gate
+    # (_passes_spec) serves them all. This entry lets run_backtest replay a spec
+    # so strategy_discovery can gate it before it goes live.
+    "DISCOVERED": (_passes_spec, "min_reward_risk", _rank_score,
+                   "MAX_DISCOVERED_PICKS_PER_DAY"),
 }
 
 

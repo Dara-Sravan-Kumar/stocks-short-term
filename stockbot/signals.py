@@ -5,7 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 
 import config
-from stockbot import db, fundamentals, strategy_engine
+from stockbot import db, fundamentals, strategy_engine, strategy_spec
 from stockbot.indicators import Snapshot, derive_target_stop
 
 
@@ -528,6 +528,41 @@ def scan_breakout_52w_picks(conn: sqlite3.Connection, snapshots: dict[str, Snaps
     return _scan_channel(conn, "BREAKOUT_52W", snapshots, sentiments, date, warnings,
                         context, top_n, config.MAX_BREAKOUT_52W_PICKS_PER_DAY,
                         _passes_breakout_52w, "min_reward_risk", _breakout_52w_rationale)
+
+
+# ---------------------------------------------------------------------------
+# DISCOVERED channel — data-driven spec variants (stockbot/strategy_spec.py).
+# One gate serves every variant: it reads that variant's own entry_expr from
+# params and evaluates it with the safe interpreter. New strategies (from the
+# web discoverer / mixer) plug in here without any new gate code.
+# ---------------------------------------------------------------------------
+def _passes_spec(s: Snapshot, params: dict, context: dict | None = None) -> bool:
+    if not _is_liquid(s):
+        return False
+    expr = params.get("entry_expr")
+    if not expr:
+        return False
+    if not strategy_spec.evaluate_entry(expr, s):
+        return False
+    return _passes_toggles(s, params, context or {})
+
+
+def _discovered_rationale(s: Snapshot, rr: float, sent: float, notes: str) -> str:
+    tier = config.TIER.get(s.ticker, "LARGE")
+    return (f"[{tier}] DISCOVERED spec: RSI {s.rsi:.0f}, close {s.close:.2f} vs "
+            f"SMA20 {s.sma20:.2f}, CMF {s.cmf:+.2f}, R:R {rr:.1f}")
+
+
+def scan_discovered_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
+                          sentiments: dict[str, dict], date: str,
+                          warnings: list[str], top_n: int | None = None) -> list[dict]:
+    """DISCOVERED channel: evaluate every active spec variant's own entry
+    expression. Variants are registered by stockbot/strategy_discovery.py after
+    clearing the backtest gate."""
+    context = build_toggle_context(snapshots)
+    return _scan_channel(conn, "DISCOVERED", snapshots, sentiments, date, warnings,
+                        context, top_n, config.MAX_DISCOVERED_PICKS_PER_DAY,
+                        _passes_spec, "min_reward_risk", _discovered_rationale)
 
 
 def _insert_candidates(conn: sqlite3.Connection, candidates: list[Candidate],

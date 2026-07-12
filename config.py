@@ -372,6 +372,25 @@ STRATEGY_FLEET_MAX_BY_CHANNEL = {
     "ANCHORED_VWAP": 4, "VOLUME_PROFILE": 4, "BREAKOUT_52W": 4,
 }
 
+# ---------------------------------------------------------------------------
+# DISCOVERED channel — data-driven strategy specs (stockbot/strategy_spec.py)
+# sourced from the web discoverer / genetic mixer, NOT from LLM parameter
+# mutation. Deliberately absent from EVOLVING_CHANNELS so the wildcard/param-
+# tweak machinery skips it; it has its own retire (no param-mutation backfill)
+# and its own registration gate below.
+# ---------------------------------------------------------------------------
+MAX_DISCOVERED_PICKS_PER_DAY = None
+DISCOVERED_FLEET_MAX = 12               # cap live discovered variants (bounds fleet growth)
+
+# Backtest gate — a spec must clear this on OUT-OF-SAMPLE history before it can
+# enter the live fleet. This is the overfitting defense: proposals are cheap,
+# so the bar to go live is deliberately real.
+BACKTEST_GATE_EVAL_DAYS = 250          # total window replayed (~1 trading year)
+BACKTEST_GATE_OOS_FRACTION = 0.35      # most-recent 35% held out as out-of-sample
+BACKTEST_GATE_MIN_TRADES = 15          # per window; fewer = too small a sample to trust
+BACKTEST_GATE_MIN_PROFIT_FACTOR = 1.2  # OOS gross-win / gross-loss floor
+BACKTEST_GATE_MIN_WIN_RATE = 40.0      # OOS win-rate floor (%)
+
 # Guardrail bounds for LLM-proposed parameter variants (min, max) per channel.
 # propose_new_variant() clamps any proposal into these ranges before it's ever
 # considered — keeps proposals sane and comparable regardless of what the model returns.

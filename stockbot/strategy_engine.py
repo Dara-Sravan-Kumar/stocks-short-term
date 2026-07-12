@@ -89,6 +89,12 @@ def _breakout_52w_defaults() -> dict:
     }
 
 
+def _discovered_defaults() -> dict:
+    # entry_expr is the spec's whole entry logic; it survives resolve_params
+    # only because it's a declared default key (unknown keys are dropped there).
+    return {"entry_expr": "", "min_reward_risk": config.MIN_REWARD_RISK}
+
+
 _CHANNEL_DEFAULTS = {
     "TECHNICAL": _technical_defaults,
     "PULLBACK": _pullback_defaults,
@@ -98,6 +104,7 @@ _CHANNEL_DEFAULTS = {
     "ANCHORED_VWAP": _anchored_vwap_defaults,
     "VOLUME_PROFILE": _volume_profile_defaults,
     "BREAKOUT_52W": _breakout_52w_defaults,
+    "DISCOVERED": _discovered_defaults,
 }
 
 
@@ -357,7 +364,7 @@ def current_capital_weights(conn: sqlite3.Connection) -> dict[str, float]:
     computed fresh from the DB (no side effects) — for callers like the
     observability dashboard that just want to display them, not evolve the fleet.
     """
-    all_active = [s for ch in (*config.EVOLVING_CHANNELS, "NEWS")
+    all_active = [s for ch in (*config.EVOLVING_CHANNELS, "NEWS", "DISCOVERED")
                  for s in db.get_active_strategies(conn, channel=ch)]
     return _capital_weights(all_active, db.get_strategy_ledger_stats(conn))
 
@@ -459,6 +466,28 @@ def evaluate_and_evolve(conn: sqlite3.Connection, date: str, run_slot: str,
                 db.set_graduate_candidate(conn, key, True)
                 events.append({"type": "graduate_candidate", "variant_key": key})
 
+    # DISCOVERED variants retire on the same performance bar, but are NOT
+    # backfilled by parameter mutation — they come from strategy_discovery
+    # (web/mixer), so a bad spec simply exits the fleet.
+    for variant in db.get_active_strategies(conn, channel="DISCOVERED"):
+        if not variant["retirable"]:
+            continue
+        key = variant["variant_key"]
+        stats = ledger_stats.get(key, {"closed": 0, "win_rate": 0.0, "realized_pnl": 0.0})
+        closed = stats["closed"]
+        stalled = (closed < config.STRATEGY_MIN_TRADES_FOR_RETIREMENT
+                   and _days_since(variant["created_at"], date) >= config.STRATEGY_STALLED_DAYS)
+        eligible = closed >= config.STRATEGY_MIN_TRADES_FOR_RETIREMENT
+        underperforming = (stats["realized_pnl"] <= 0
+                           or stats["win_rate"] < config.STRATEGY_RETIREMENT_WIN_RATE_FLOOR)
+        if stalled or (eligible and underperforming):
+            reason = ("stalled: too few trades after "
+                      f"{config.STRATEGY_STALLED_DAYS}+ days" if stalled else
+                      f"underperforming after {closed} trades: win rate "
+                      f"{stats['win_rate']:.0f}%, realized pnl {stats['realized_pnl']:.0f}")
+            db.retire_strategy(conn, key, reason, date)
+            events.append({"type": "retired", "variant_key": key, "reason": reason})
+
     for channel in config.EVOLVING_CHANNELS:
         active_count = len(db.get_active_strategies(conn, channel=channel))
         fleet_max = config.STRATEGY_FLEET_MAX_BY_CHANNEL.get(channel, config.STRATEGY_FLEET_MAX)
@@ -477,7 +506,7 @@ def evaluate_and_evolve(conn: sqlite3.Connection, date: str, run_slot: str,
 
     active_by_channel = {
         channel: db.get_active_strategies(conn, channel=channel)
-        for channel in (*config.EVOLVING_CHANNELS, "NEWS")
+        for channel in (*config.EVOLVING_CHANNELS, "NEWS", "DISCOVERED")
     }
     all_active = [s for rows in active_by_channel.values() for s in rows]
     capital_weights = _capital_weights(all_active, ledger_stats)
