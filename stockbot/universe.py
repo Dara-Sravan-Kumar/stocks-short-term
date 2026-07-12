@@ -4,6 +4,7 @@ Sources (updated by NSE on every index rebalance):
   - NIFTY 100          -> LARGE tier
   - NIFTY Midcap 150   -> MID tier
   - NIFTY Smallcap 250 -> SMALL tier
+  - NIFTY Microcap 250 -> MICRO tier
 
 Constituents are cached in the `universe` table and refreshed weekly.
 Fallback chain: fresh NSE fetch -> last cached copy in DB -> static
@@ -24,6 +25,8 @@ INDEX_SOURCES = {
     "LARGE": "https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv",
     "MID": "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
     "SMALL": "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+    # Microcap 250's file name has an underscore before "list" (the others don't).
+    "MICRO": "https://nsearchives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv",
 }
 
 HEADERS = {

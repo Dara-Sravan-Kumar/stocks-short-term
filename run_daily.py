@@ -106,7 +106,7 @@ def main() -> int:
             warnings.append(f"{ticker}: indicator computation failed ({exc}) - skipped")
 
     # ------------------------------------------------------- news + sentiment
-    from stockbot.signals import _is_liquid, _passes_technicals, _passes_pullback
+    from stockbot.signals import _passes_technicals, _passes_pullback
     # Screened against each channel's default/seed thresholds — a quick net-widener
     # for sentiment scoring, not the actual per-variant gate the picks scan applies.
     _tech_defaults = strategy_engine.resolve_params("TECHNICAL", None)
@@ -127,9 +127,12 @@ def main() -> int:
         headlines = {t: [] for t in sentiment_universe}
         use_llm = False
     else:
-        # News-first channel sweeps every LIQUID ticker (illiquid names could
-        # never become picks, so their news is skipped to bound runtime).
-        liquid = [t for t, s in snapshots.items() if _is_liquid(s)]
+        # News-first channel sweeps the more-liquid names only (NEWS_MIN_AVG_TURNOVER,
+        # not the wider ₹2cr entry gate): news+LLM scoring is the expensive part of a
+        # run, and microcaps rarely have the coverage the NEWS channel needs. The 8
+        # chart channels still scan the full universe (sentiment is a neutral-pass veto).
+        liquid = [t for t, s in snapshots.items()
+                  if s.avg_turnover_20d >= config.NEWS_MIN_AVG_TURNOVER]
         news_universe = sorted(set(liquid) | set(active) | set(held))
         print(f"Collecting news for {len(news_universe)} liquid tickers "
               f"(of {len(universe)} scanned, parallel)...")
