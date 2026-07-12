@@ -332,6 +332,24 @@ def main() -> int:
         holdings_provenance=holdings_provenance,
     )
 
+    # ----------------------------------------------------- daily strategy R&D
+    # Once a day, on the evening heavy run, discover published strategies and
+    # breed genetic-mixer offspring — each gated on an out-of-sample backtest
+    # before it can join the DISCOVERED fleet. Runs at the tail (Discord/
+    # dashboard already out), reuses the histories already fetched, and is fully
+    # guarded so a discovery failure can never break the trading run. New specs
+    # are live for the next morning's run.
+    if run_slot == "PM" and not args.skip_news and use_llm:
+        try:
+            from stockbot import strategy_discovery, strategy_mixer
+            print("Running daily strategy discovery + mixing...")
+            disc = strategy_discovery.discover_and_register(conn, histories, warnings)
+            mix = strategy_mixer.mix_and_register(conn, histories, warnings)
+            print(f"  Discovery: {len(disc['registered'])}/{disc['proposed']} registered; "
+                  f"Mixer: {len(mix['registered'])}/{mix['proposed']} registered")
+        except Exception as exc:
+            warnings.append(f"strategy discovery/mixing failed: {exc}")
+
     db.log_run(conn, run_date, started_at, datetime.now().isoformat(timespec="seconds"),
                len(histories), len(new_picks), len(closed), warnings)
     conn.close()
