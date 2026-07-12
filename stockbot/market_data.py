@@ -19,17 +19,22 @@ def today_ist() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d")
 
 
-def fetch_history(tickers: list[str], warnings: list[str]) -> dict[str, pd.DataFrame]:
-    """~1y of daily bars per ticker: Fyers first, yfinance for the rest.
+def fetch_history(tickers: list[str], warnings: list[str],
+                  period: str | None = None) -> dict[str, pd.DataFrame]:
+    """Daily bars per ticker: Fyers first, yfinance for the rest.
 
-    Returns {ticker: DataFrame[Open, High, Low, Close, Volume]} keeping only
-    tickers with enough clean history.
+    period overrides config.HISTORY_PERIOD (e.g. "2y"/"5y"/"max" for a deeper
+    on-demand backtest). Because Fyers historical is ~1y per request, a deeper-
+    than-default period goes straight to yfinance, which handles multi-year
+    cleanly. Returns {ticker: DataFrame[Open, High, Low, Close, Volume]} keeping
+    only tickers with enough clean history.
     """
+    period = period or config.HISTORY_PERIOD
     tickers = sorted(set(tickers))
     if not tickers:
         return {}
     creds = config.fyers_settings()
-    if creds["app_id"] and creds["secret_id"]:
+    if period == config.HISTORY_PERIOD and creds["app_id"] and creds["secret_id"]:
         try:
             out = fyers_data.fetch_history(tickers, warnings)
         except Exception as exc:
@@ -40,19 +45,19 @@ def fetch_history(tickers: list[str], warnings: list[str]) -> dict[str, pd.DataF
             if missing:
                 warnings.append(f"Fyers missed {len(missing)} of {len(tickers)} "
                                 "tickers - filling from yfinance")
-                out.update(_fetch_yfinance(missing, warnings))
+                out.update(_fetch_yfinance(missing, warnings, period))
             return out
         warnings.append("Fyers returned no data - falling back to yfinance")
-    return _fetch_yfinance(tickers, warnings)
+    return _fetch_yfinance(tickers, warnings, period)
 
 
-def _fetch_yfinance(tickers: list[str],
-                    warnings: list[str]) -> dict[str, pd.DataFrame]:
+def _fetch_yfinance(tickers: list[str], warnings: list[str],
+                    period: str | None = None) -> dict[str, pd.DataFrame]:
     """Original one-shot batched yfinance download."""
     try:
         raw = yf.download(
             tickers,
-            period=config.HISTORY_PERIOD,
+            period=period or config.HISTORY_PERIOD,
             interval="1d",
             group_by="ticker",
             auto_adjust=False,

@@ -98,7 +98,7 @@ def test_market_data_prefers_fyers_and_fills_gaps(monkeypatch):
     monkeypatch.setattr(market_data.fyers_data, "fetch_history",
                         lambda tickers, w: {"TCS.NS": "FYERS_DF"})
     monkeypatch.setattr(market_data, "_fetch_yfinance",
-                        lambda tickers, w: {t: "YF_DF" for t in tickers})
+                        lambda tickers, w, period=None: {t: "YF_DF" for t in tickers})
     warnings = []
     out = market_data.fetch_history(["TCS.NS", "INFY.NS"], warnings)
     assert out == {"TCS.NS": "FYERS_DF", "INFY.NS": "YF_DF"}
@@ -111,7 +111,7 @@ def test_market_data_full_fallback_when_fyers_empty(monkeypatch):
     monkeypatch.setattr(market_data.fyers_data, "fetch_history",
                         lambda tickers, w: {})
     monkeypatch.setattr(market_data, "_fetch_yfinance",
-                        lambda tickers, w: {t: "YF_DF" for t in tickers})
+                        lambda tickers, w, period=None: {t: "YF_DF" for t in tickers})
     warnings = []
     out = market_data.fetch_history(["TCS.NS"], warnings)
     assert out == {"TCS.NS": "YF_DF"}
@@ -124,7 +124,7 @@ def test_market_data_skips_fyers_without_creds(monkeypatch):
     monkeypatch.setattr(market_data.fyers_data, "fetch_history",
                         lambda tickers, w: pytest.fail("should not be called"))
     monkeypatch.setattr(market_data, "_fetch_yfinance",
-                        lambda tickers, w: {t: "YF_DF" for t in tickers})
+                        lambda tickers, w, period=None: {t: "YF_DF" for t in tickers})
     assert market_data.fetch_history(["TCS.NS"], []) == {"TCS.NS": "YF_DF"}
 
 

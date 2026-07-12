@@ -213,12 +213,13 @@ def run_backtest(histories: dict[str, pd.DataFrame], variants: list[dict],
 
 def run_and_save(days: int = 120, tickers_cap: int | None = None,
                  channels: list[str] | None = None, capital: float = 100_000.0,
-                 seeds_only: bool = False, warnings: list | None = None,
-                 progress=None) -> dict:
+                 seeds_only: bool = False, period: str | None = None,
+                 warnings: list | None = None, progress=None) -> dict:
     """Full fleet backtest: load universe, fetch history, replay, and write the
     result JSON to data/backtests/. Shared by the CLI (backtest.py) and the
-    dashboard's Run button. Returns the saved payload (plus 'path', or 'error').
-    """
+    dashboard's Run button. `period` overrides the history depth fetched (e.g.
+    "3y" for a multi-year replay). Returns the saved payload (plus 'path', or
+    'error')."""
     from stockbot import db, market_data
     warnings = warnings if warnings is not None else []
     conn = db.connect()
@@ -232,7 +233,7 @@ def run_and_save(days: int = 120, tickers_cap: int | None = None,
     finally:
         conn.close()
 
-    histories = market_data.fetch_history(tickers, warnings)
+    histories = market_data.fetch_history(tickers, warnings, period=period)
     if not histories:
         return {"error": "no market data available", "results": {}}
     results = run_backtest(histories, variants, days, capital, progress=progress)
