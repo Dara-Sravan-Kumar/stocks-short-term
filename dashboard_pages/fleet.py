@@ -123,12 +123,23 @@ def _backtest_runner():
                "live gate/exit/cost code, and saves it to the Backtest page. "
                "Heavy: fetches history + replays, so it can take a few minutes.")
     c = st.columns(4)
-    days = c[0].number_input("Sessions", 20, 500, 120, step=10)
+    periods = {"1 Month (~21)": 21, "3 Months (~63)": 63, "6 Months (~126)": 126,
+               "1 Year (max, ~240)": 240, "Custom sessions…": None}
+    period = c[0].selectbox("Period", list(periods), index=1,
+                            help="How far back to replay. Capped at the ~1y of "
+                                 "daily history fetched per ticker.")
+    days = periods[period]
+    if days is None:
+        days = c[0].number_input("Sessions", 20, 250, 120, step=10)
     tcap = c[1].number_input("Max tickers", 10, 500, 60, step=10,
                              help="Cap the universe for a faster run")
     capital = c[2].number_input("₹ per trade", 10_000, 1_000_000, 100_000, step=10_000)
     seeds = c[3].checkbox("Seeds only", value=False,
                           help="Test each channel's seed defaults, skip DB variants")
+    st.caption("Only ~1 year of daily bars is fetched per ticker "
+               "(config.HISTORY_PERIOD), so longer periods are capped at what's "
+               "available. Want multi-year backtests? That needs a deeper history "
+               "fetch — ask and I'll wire it in.")
 
     if st.button("▶ Run backtest", type="primary"):
         with st.spinner("Fetching history and replaying the fleet…"):
