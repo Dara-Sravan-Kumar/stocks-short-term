@@ -13,14 +13,12 @@ trade) to data/backtests/.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-from datetime import datetime
 
 from dotenv import load_dotenv
 
 import config
-from stockbot import backtest, db, market_data
+from stockbot import backtest
 
 
 def main() -> int:
@@ -40,28 +38,17 @@ def main() -> int:
     load_dotenv(config.PROJECT_ROOT / ".env")
     warnings: list[str] = []
 
-    conn = db.connect()
-    from stockbot import universe as universe_mod
-    uni = universe_mod.load(conn, warnings)
-    universe_mod.apply(uni)
-    tickers = sorted(config.WATCHLIST)
-    if args.tickers:
-        tickers = tickers[:args.tickers]
-
     channels = args.channels.upper().split(",") if args.channels else None
-    variants = backtest.build_variant_list(None if args.seeds_only else conn,
-                                           channels)
-    print(f"Backtest: {len(tickers)} tickers x {args.days} sessions, "
-          f"{len(variants)} variants, Rs {args.capital:,.0f}/trade")
-
-    print(f"Fetching history for {len(tickers)} tickers...")
-    histories = market_data.fetch_history(tickers, warnings)
-    if not histories:
-        print("FATAL: no market data")
+    print(f"Backtest: up to {args.tickers or 'all'} tickers x {args.days} sessions, "
+          f"Rs {args.capital:,.0f}/trade")
+    payload = backtest.run_and_save(
+        days=args.days, tickers_cap=args.tickers, channels=channels,
+        capital=args.capital, seeds_only=args.seeds_only, warnings=warnings,
+        progress=print)
+    if payload.get("error"):
+        print("FATAL:", payload["error"])
         return 1
-    print(f"Replaying {args.days} sessions over {len(histories)} tickers...")
-    results = backtest.run_backtest(histories, variants, args.days,
-                                    args.capital, progress=print)
+    results = payload["results"]
 
     # ---------------------------------------------------------------- report
     rows = sorted(results.items(),
@@ -82,17 +69,7 @@ def main() -> int:
 
     for w in warnings[:10]:
         print("WARN:", w)
-
-    out_dir = config.DATA_DIR / "backtests"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = out_dir / f"backtest_{stamp}.json"
-    out_path.write_text(json.dumps(
-        {"run_at": stamp, "days": args.days, "tickers": len(histories),
-         "capital_per_trade": args.capital, "results": results},
-        indent=2, default=str), encoding="utf-8")
-    print(f"\nFull results (incl. every trade) -> {out_path}")
-    conn.close()
+    print(f"\nFull results (incl. every trade) -> {payload['path']}")
     return 0
 
 

@@ -15,7 +15,7 @@ from dashboard_pages import common
 
 def _fleet_table(conn) -> pd.DataFrame:
     ledger_stats = db.get_strategy_ledger_stats(conn)
-    all_active = [s for ch in (*config.EVOLVING_CHANNELS, "NEWS")
+    all_active = [s for ch in (*config.EVOLVING_CHANNELS, "NEWS", "DISCOVERED")
                   for s in db.get_active_strategies(conn, channel=ch)]
     weights = strategy_engine.current_capital_weights(conn)
 

@@ -14,7 +14,8 @@ from __future__ import annotations
 import streamlit as st
 
 import config
-from dashboard_pages import backtests, book, common, history, ledger, summary, trades
+from dashboard_pages import (backtests, book, common, fleet, history, ledger,
+                             summary, trades)
 
 st.set_page_config(page_title="StockBot Dashboard", page_icon="📊", layout="wide")
 
@@ -46,6 +47,7 @@ nav = st.navigation(
         st.Page(book.page, title="Book", icon="💼", url_path="book"),
         st.Page(trades.page, title="All Trades", icon="🧾", url_path="trades"),
         st.Page(ledger.page, title="Ledger", icon="📒", url_path="ledger"),
+        st.Page(fleet.page, title="Fleet", icon="🛰️", url_path="fleet"),
         st.Page(history.page, title="History", icon="📜", url_path="history"),
         st.Page(backtests.page, title="Backtest", icon="🧪", url_path="backtest"),
     ],

@@ -22,6 +22,7 @@ positions opened on D are exit-eligible from D+1.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pandas as pd
 
@@ -208,6 +209,43 @@ def run_backtest(histories: dict[str, pd.DataFrame], variants: list[dict],
                      f"{sum(len(b.positions) for b in books)}")
 
     return {b.variant["variant_key"]: _report(b, eval_dates) for b in books}
+
+
+def run_and_save(days: int = 120, tickers_cap: int | None = None,
+                 channels: list[str] | None = None, capital: float = 100_000.0,
+                 seeds_only: bool = False, warnings: list | None = None,
+                 progress=None) -> dict:
+    """Full fleet backtest: load universe, fetch history, replay, and write the
+    result JSON to data/backtests/. Shared by the CLI (backtest.py) and the
+    dashboard's Run button. Returns the saved payload (plus 'path', or 'error').
+    """
+    from stockbot import db, market_data
+    warnings = warnings if warnings is not None else []
+    conn = db.connect()
+    try:
+        from stockbot import universe as universe_mod
+        universe_mod.apply(universe_mod.load(conn, warnings))
+        tickers = sorted(config.WATCHLIST)
+        if tickers_cap:
+            tickers = tickers[:tickers_cap]
+        variants = build_variant_list(None if seeds_only else conn, channels)
+    finally:
+        conn.close()
+
+    histories = market_data.fetch_history(tickers, warnings)
+    if not histories:
+        return {"error": "no market data available", "results": {}}
+    results = run_backtest(histories, variants, days, capital, progress=progress)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = config.DATA_DIR / "backtests"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"backtest_{stamp}.json"
+    payload = {"run_at": stamp, "days": days, "tickers": len(histories),
+               "capital_per_trade": capital, "results": results}
+    out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    payload["path"] = str(out_path)
+    return payload
 
 
 def _report(book: _Book, eval_dates: list) -> dict:
