@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS picks (
   created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_pick
-  ON picks(ticker) WHERE status = 'ACTIVE';
+  ON picks(ticker, channel) WHERE status = 'ACTIVE';   -- one ACTIVE pick per
+  -- (ticker, variant): every strategy variant may test the same stock at once
 
 CREATE TABLE IF NOT EXISTS holdings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,7 +119,8 @@ CREATE TABLE IF NOT EXISTS paper_positions (
   created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_open_paper_pos
-  ON paper_positions(ticker) WHERE status = 'OPEN';
+  ON paper_positions(ticker, strategy) WHERE status = 'OPEN';  -- one OPEN
+  -- position per (ticker, variant); mirrors uq_active_pick above
 
 CREATE TABLE IF NOT EXISTS paper_trades (   -- immutable ledger, one row per order
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -222,6 +224,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE holdings ADD COLUMN source TEXT NOT NULL DEFAULT 'MOCK'")
         conn.execute("ALTER TABLE holdings ADD COLUMN synced_at TEXT")
         conn.commit()
+
+    # Widen the uniqueness locks from (ticker) to (ticker, variant) so every
+    # strategy variant can hold its own ACTIVE pick / OPEN position in the same
+    # stock — the multi-variant testing change. CREATE ... IF NOT EXISTS in
+    # SCHEMA leaves an existing single-column index untouched, so drop & rebuild
+    # the old form here (idempotent: skipped once the composite index is live).
+    for idx, rebuild_sql in (
+        ("uq_active_pick",
+         "CREATE UNIQUE INDEX uq_active_pick ON picks(ticker, channel) "
+         "WHERE status = 'ACTIVE'"),
+        ("uq_open_paper_pos",
+         "CREATE UNIQUE INDEX uq_open_paper_pos ON paper_positions(ticker, strategy) "
+         "WHERE status = 'OPEN'"),
+    ):
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (idx,)
+        ).fetchone()
+        if row and row["sql"] and "channel" not in row["sql"] and "strategy" not in row["sql"]:
+            conn.execute(f"DROP INDEX {idx}")
+            conn.execute(rebuild_sql)
+            conn.commit()
 
     # Seed the strategy registry once per channel: today's fixed TECHNICAL/
     # PULLBACK behavior becomes the "seed" variant, NEWS gets a permanent
@@ -507,6 +530,18 @@ def get_open_paper_positions(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def get_open_paper_position(conn: sqlite3.Connection, ticker: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM paper_positions WHERE status = 'OPEN' AND ticker = ?", (ticker,)
+    ).fetchone()
+
+
+def get_open_paper_position_by_pick(conn: sqlite3.Connection,
+                                    pick_id: int | None) -> sqlite3.Row | None:
+    """Resolve the OPEN position for a specific pick. Now that a ticker can carry
+    several open positions (one per variant), exits must match by pick_id, not
+    ticker, to sell the right one."""
+    if pick_id is None:
+        return None
+    return conn.execute(
+        "SELECT * FROM paper_positions WHERE status = 'OPEN' AND pick_id = ?", (pick_id,)
     ).fetchone()
 
 

@@ -47,22 +47,22 @@ def test_sell_costs_include_dp_no_stamp():
 
 def test_size_position_worked_example():
     # Rs 5L book, Rs 500 stock, stop 482 (Rs 18/share risk):
-    #   risk budget 1% x 500k = 5000 / 18 = 277 shares
-    #   2% position cap = 10000 / 500.25 fill = 19 shares  <- binds
+    #   risk budget 0.75% x 500k = 3750 / 18 = 208 shares
+    #   1.5% position cap = 7500 / 500.25 fill = 14 shares  <- binds
     qty, note = paper.size_position(equity=500_000, cash=500_000,
                                     entry_ref=500.0, stop=482.0)
-    assert qty == 19
+    assert qty == 14
     assert "position cap" in note
 
 
 def test_size_position_risk_binding():
     # A very wide stop makes risk the binding constraint even under the small
-    # 2% position cap: entry 100, stop 40 => Rs 60/share risk.
-    #   risk budget 1% x 500k = 5000 / 60 = 83 shares      <- binds
-    #   2% position cap = 10000 / 100.05 fill = 99 shares
+    # 1.5% position cap: entry 100, stop 40 => Rs 60/share risk.
+    #   risk budget 0.75% x 500k = 3750 / 60 = 62 shares    <- binds
+    #   1.5% position cap = 7500 / 100.05 fill = 74 shares
     qty, note = paper.size_position(equity=500_000, cash=500_000,
                                     entry_ref=100.0, stop=40.0)
-    assert qty == 83
+    assert qty == 62
     assert "risk" in note
 
 
@@ -84,7 +84,7 @@ def test_size_position_rejects_bad_stop():
 # ---------------------------------------------------------------------------
 
 def test_size_position_respects_budget_cap():
-    # Unconstrained, the 2% position cap binds at 19 (see worked example above).
+    # Unconstrained, the 1.5% position cap binds at 14 (see worked example above).
     # A tighter strategy budget (Rs 6000, ~11 shares) becomes the new binding
     # constraint — chosen so the result still clears PAPER_MIN_POSITION_VALUE
     # (else it would be skipped as too small, not capped).
@@ -114,8 +114,8 @@ def conn(tmp_path):
 
 
 def _pick(ticker="TESTX.NS", entry=500.0, stop=482.0, target=540.0,
-          channel="TECHNICAL"):
-    return {"ticker": ticker, "entry_price": entry, "stop_price": stop,
+          channel="TECHNICAL", pick_id=1):
+    return {"id": pick_id, "ticker": ticker, "entry_price": entry, "stop_price": stop,
             "target_price": target, "channel": channel,
             "rationale": "unit test", "reward_risk": 2.2}
 
@@ -135,7 +135,7 @@ def test_open_close_round_trip_reconciles(conn):
         config.PAPER_STARTING_CASH - buy["invested"], abs=0.01)
 
     sells = paper.close_positions_for_exits(
-        conn, [{"ticker": "TESTX.NS", "status": "TARGET_HIT",
+        conn, [{"id": 1, "ticker": "TESTX.NS", "status": "TARGET_HIT",
                 "exit_price": 540.0, "exit_reason": "target reached"}],
         "2026-07-10", "PM", warnings)
     assert len(sells) == 1
@@ -194,6 +194,33 @@ def test_duplicate_open_position_rejected(conn):
                                    "AM", warnings)
     assert db.get_paper_book(conn)["cash"] == cash_before
     assert any("already exists" in w for w in warnings)
+
+
+def test_same_ticker_multiple_strategies_coexist(conn):
+    """Multi-variant testing: the same stock can be held by different strategy
+    variants concurrently, and an exit closes only the matching variant's
+    position (matched by pick_id, not ticker)."""
+    warnings = []
+    a = paper.open_positions_for_picks(
+        conn, [_pick("ZZZ.NS", channel="TECHNICAL", pick_id=101)], {},
+        "2026-07-06", "AM", warnings)
+    b = paper.open_positions_for_picks(
+        conn, [_pick("ZZZ.NS", channel="ORDERFLOW", pick_id=102)], {},
+        "2026-07-06", "AM", warnings)
+    assert a[0]["action"] == "BUY" and b[0]["action"] == "BUY"
+    open_pos = db.get_open_paper_positions(conn)
+    assert len(open_pos) == 2
+    assert {p["strategy"] for p in open_pos} == {"TECHNICAL", "ORDERFLOW"}
+    assert all(p["ticker"] == "ZZZ.NS" for p in open_pos)
+
+    # exit only the ORDERFLOW pick (id 102): the TECHNICAL leg must stay open
+    sells = paper.close_positions_for_exits(
+        conn, [{"id": 102, "ticker": "ZZZ.NS", "status": "TARGET_HIT",
+                "exit_price": 540.0, "exit_reason": "target"}],
+        "2026-07-10", "PM", warnings)
+    assert len(sells) == 1 and sells[0]["strategy"] == "ORDERFLOW"
+    still_open = db.get_open_paper_positions(conn)
+    assert len(still_open) == 1 and still_open[0]["strategy"] == "TECHNICAL"
 
 
 def test_open_positions_for_picks_respects_capital_weights(conn):

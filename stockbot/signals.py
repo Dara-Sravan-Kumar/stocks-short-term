@@ -359,27 +359,37 @@ def _gather_candidates(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
 
 def _scan_channel(conn: sqlite3.Connection, channel: str, snapshots: dict[str, Snapshot],
                   sentiments: dict[str, dict], date: str, warnings: list[str],
-                  active: set[str], context: dict, top_n: int | None,
+                  context: dict, top_n: int | None,
                   max_per_day_default: int | None, gate_fn, rr_key: str,
                   rationale_fn, score_fn=None) -> list[dict]:
     """Loop every active variant of `channel`, gather its candidates, insert up
-    to its daily cap. A ticker claimed by an earlier variant this run is
-    skipped for the rest (mirrors the pre-existing one-ACTIVE-pick-per-ticker
-    rule that already made NEWS/TECHNICAL/PULLBACK compete for the same ticker).
+    to its daily cap. Each variant only skips tickers IT already holds an ACTIVE
+    pick on — different variants (and different channels) are free to test the
+    SAME ticker concurrently, so every variant builds its own track record on
+    the same scarce qualifying setups (uq_active_pick is keyed on ticker+channel).
     """
     variants = db.get_active_strategies(conn, channel=channel)
     if not variants:
         variants = [{"variant_key": f"{channel}_seed", "params_json": None}]
 
+    # Held tickers per variant_key, snapshotted once before the loop so a pick
+    # inserted by one variant this run doesn't block another variant from also
+    # testing it.
+    held_by_variant: dict[str, set[str]] = {}
+    for p in db.get_active_picks(conn):
+        held_by_variant.setdefault(p["channel"], set()).add(p["ticker"])
+
     inserted: list[dict] = []
     for variant in variants:
+        variant_key = variant["variant_key"]
         params = strategy_engine.resolve_params(channel, variant["params_json"])
-        candidates = _gather_candidates(conn, snapshots, sentiments, date, warnings, active,
-                                        params, context, gate_fn, rr_key, rationale_fn, score_fn)
+        candidates = _gather_candidates(
+            conn, snapshots, sentiments, date, warnings,
+            held_by_variant.get(variant_key, set()),
+            params, context, gate_fn, rr_key, rationale_fn, score_fn)
         cap = top_n if top_n is not None else max_per_day_default
         chosen = candidates[:cap]
-        inserted += _insert_candidates(conn, chosen, date, variant["variant_key"])
-        active |= {c.snap.ticker for c in chosen}
+        inserted += _insert_candidates(conn, chosen, date, variant_key)
     return inserted
 
 
@@ -387,9 +397,8 @@ def scan_new_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
                    sentiments: dict[str, dict], date: str,
                    warnings: list[str], top_n: int | None = None) -> list[dict]:
     """TECHNICAL channel: evaluate the watchlist against every active variant."""
-    active = {p["ticker"] for p in db.get_active_picks(conn)}
     context = build_toggle_context(snapshots)
-    return _scan_channel(conn, "TECHNICAL", snapshots, sentiments, date, warnings, active,
+    return _scan_channel(conn, "TECHNICAL", snapshots, sentiments, date, warnings,
                         context, top_n, config.MAX_NEW_PICKS_PER_DAY,
                         _passes_technicals, "min_reward_risk", _technical_rationale)
 
@@ -406,7 +415,9 @@ def scan_news_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
     shape rather than going through _gather_candidates.
     """
     top_n = top_n if top_n is not None else config.MAX_NEWS_PICKS_PER_DAY
-    active = {p["ticker"] for p in db.get_active_picks(conn)}
+    # NEWS is a single strategy: only skip tickers NEWS itself already holds, so
+    # a stock held by the chart channels can still be tested on a news catalyst.
+    active = {p["ticker"] for p in db.get_active_picks(conn) if p["channel"] == "NEWS"}
 
     candidates: list[Candidate] = []
     for ticker, sent_info in sentiments.items():
@@ -452,9 +463,8 @@ def scan_pullback_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapshot]
                         warnings: list[str], top_n: int | None = None) -> list[dict]:
     """PULLBACK channel: buy the dip to SMA20 inside an uptrend, evaluated
     against every active variant."""
-    active = {p["ticker"] for p in db.get_active_picks(conn)}
     context = build_toggle_context(snapshots)
-    return _scan_channel(conn, "PULLBACK", snapshots, sentiments, date, warnings, active,
+    return _scan_channel(conn, "PULLBACK", snapshots, sentiments, date, warnings,
                         context, top_n, config.MAX_PULLBACK_PICKS_PER_DAY,
                         _passes_pullback, "pullback_min_reward_risk", _pullback_rationale,
                         score_fn=_pullback_score)
@@ -464,9 +474,8 @@ def scan_orderflow_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapshot
                         sentiments: dict[str, dict], date: str,
                         warnings: list[str], top_n: int | None = None) -> list[dict]:
     """ORDER FLOW channel (Chaikin Money Flow proxy) — see _passes_orderflow."""
-    active = {p["ticker"] for p in db.get_active_picks(conn)}
     context = build_toggle_context(snapshots)
-    return _scan_channel(conn, "ORDERFLOW", snapshots, sentiments, date, warnings, active,
+    return _scan_channel(conn, "ORDERFLOW", snapshots, sentiments, date, warnings,
                         context, top_n, config.MAX_ORDERFLOW_PICKS_PER_DAY,
                         _passes_orderflow, "min_reward_risk", _orderflow_rationale)
 
@@ -475,9 +484,8 @@ def scan_liquidity_sweep_picks(conn: sqlite3.Connection, snapshots: dict[str, Sn
                                sentiments: dict[str, dict], date: str,
                                warnings: list[str], top_n: int | None = None) -> list[dict]:
     """LIQUIDITY SWEEP channel (stop-hunt-then-reclaim) — see _passes_liquidity_sweep."""
-    active = {p["ticker"] for p in db.get_active_picks(conn)}
     context = build_toggle_context(snapshots)
-    return _scan_channel(conn, "LIQUIDITY_SWEEP", snapshots, sentiments, date, warnings, active,
+    return _scan_channel(conn, "LIQUIDITY_SWEEP", snapshots, sentiments, date, warnings,
                         context, top_n, config.MAX_LIQUIDITY_SWEEP_PICKS_PER_DAY,
                         _passes_liquidity_sweep, "min_reward_risk", _liquidity_sweep_rationale)
 
@@ -486,9 +494,8 @@ def scan_fvg_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
                    sentiments: dict[str, dict], date: str,
                    warnings: list[str], top_n: int | None = None) -> list[dict]:
     """FAIR VALUE GAP channel (3-candle imbalance retest) — see _passes_fvg."""
-    active = {p["ticker"] for p in db.get_active_picks(conn)}
     context = build_toggle_context(snapshots)
-    return _scan_channel(conn, "FVG", snapshots, sentiments, date, warnings, active,
+    return _scan_channel(conn, "FVG", snapshots, sentiments, date, warnings,
                         context, top_n, config.MAX_FVG_PICKS_PER_DAY,
                         _passes_fvg, "min_reward_risk", _fvg_rationale)
 
@@ -497,9 +504,8 @@ def scan_anchored_vwap_picks(conn: sqlite3.Connection, snapshots: dict[str, Snap
                              sentiments: dict[str, dict], date: str,
                              warnings: list[str], top_n: int | None = None) -> list[dict]:
     """ANCHORED VWAP channel (fresh reclaim) — see _passes_anchored_vwap."""
-    active = {p["ticker"] for p in db.get_active_picks(conn)}
     context = build_toggle_context(snapshots)
-    return _scan_channel(conn, "ANCHORED_VWAP", snapshots, sentiments, date, warnings, active,
+    return _scan_channel(conn, "ANCHORED_VWAP", snapshots, sentiments, date, warnings,
                         context, top_n, config.MAX_ANCHORED_VWAP_PICKS_PER_DAY,
                         _passes_anchored_vwap, "min_reward_risk", _anchored_vwap_rationale)
 
@@ -508,9 +514,8 @@ def scan_volume_profile_picks(conn: sqlite3.Connection, snapshots: dict[str, Sna
                               sentiments: dict[str, dict], date: str,
                               warnings: list[str], top_n: int | None = None) -> list[dict]:
     """VOLUME PROFILE channel (Point-of-Control support) — see _passes_volume_profile."""
-    active = {p["ticker"] for p in db.get_active_picks(conn)}
     context = build_toggle_context(snapshots)
-    return _scan_channel(conn, "VOLUME_PROFILE", snapshots, sentiments, date, warnings, active,
+    return _scan_channel(conn, "VOLUME_PROFILE", snapshots, sentiments, date, warnings,
                         context, top_n, config.MAX_VOLUME_PROFILE_PICKS_PER_DAY,
                         _passes_volume_profile, "min_reward_risk", _volume_profile_rationale)
 
@@ -519,9 +524,8 @@ def scan_breakout_52w_picks(conn: sqlite3.Connection, snapshots: dict[str, Snaps
                             sentiments: dict[str, dict], date: str,
                             warnings: list[str], top_n: int | None = None) -> list[dict]:
     """52-WEEK HIGH BREAKOUT channel — see _passes_breakout_52w."""
-    active = {p["ticker"] for p in db.get_active_picks(conn)}
     context = build_toggle_context(snapshots)
-    return _scan_channel(conn, "BREAKOUT_52W", snapshots, sentiments, date, warnings, active,
+    return _scan_channel(conn, "BREAKOUT_52W", snapshots, sentiments, date, warnings,
                         context, top_n, config.MAX_BREAKOUT_52W_PICKS_PER_DAY,
                         _passes_breakout_52w, "min_reward_risk", _breakout_52w_rationale)
 

@@ -87,6 +87,7 @@ def evaluate_active_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapsho
             db.close_pick(conn, pick["id"], status, date, round(float(exit_price), 2), reason)
             pnl = (exit_price - pick["entry_price"]) / pick["entry_price"] * 100
             closed.append({
+                "id": pick["id"], "channel": pick["channel"],
                 "ticker": ticker, "status": status, "entry_date": pick["entry_date"],
                 "entry_price": pick["entry_price"], "exit_price": round(float(exit_price), 2),
                 "exit_reason": reason, "pnl_pct": round(pnl, 2),

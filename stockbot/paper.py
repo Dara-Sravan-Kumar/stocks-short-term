@@ -222,7 +222,10 @@ def close_positions_for_exits(conn: sqlite3.Connection, closed_picks: list[dict]
     """Paper-sell open positions whose underlying pick just closed."""
     actions = []
     for exit_ in closed_picks:
-        pos = db.get_open_paper_position(conn, exit_["ticker"])
+        # match by pick_id, not ticker: a ticker may now hold several open
+        # positions (one per variant), and only the one whose pick just closed
+        # should be sold.
+        pos = db.get_open_paper_position_by_pick(conn, exit_.get("id"))
         if pos is None:
             continue  # pick predates the paper book or was never papered
 
