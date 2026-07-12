@@ -17,7 +17,19 @@ import sys
 from dotenv import load_dotenv
 
 import config
-from stockbot import db, market_data, strategy_discovery
+from stockbot import db, market_data, strategy_discovery, strategy_mixer
+
+
+def _print_report(label: str, report: dict) -> None:
+    print(f"\n[{label}] proposed: {report['proposed']}")
+    print(f"[{label}] registered ({len(report['registered'])}):")
+    for r in report["registered"]:
+        print(f"  + {r['name']}: {r['entry_expr']}")
+        if r.get("rationale"):
+            print(f"      {r['rationale']}")
+    print(f"[{label}] rejected ({len(report['rejected'])}):")
+    for r in report["rejected"]:
+        print(f"  - {r['name']} [{r['stage']}]: {r['reason']}")
 
 
 def main() -> int:
@@ -39,19 +51,14 @@ def main() -> int:
         return 1
 
     print("Asking Claude for candidate published swing strategies...")
-    report = strategy_discovery.discover_and_register(conn, histories, warnings)
+    _print_report("discover", strategy_discovery.discover_and_register(conn, histories, warnings))
 
-    print(f"\nProposed: {report['proposed']}")
-    print(f"Registered ({len(report['registered'])}):")
-    for r in report["registered"]:
-        print(f"  + {r['name']}: {r['entry_expr']}")
-        if r.get("rationale"):
-            print(f"      {r['rationale']}")
-    print(f"Rejected ({len(report['rejected'])}):")
-    for r in report["rejected"]:
-        print(f"  - {r['name']} [{r['stage']}]: {r['reason']}")
+    # Mix AFTER discovery so newly-registered specs are already in the gene pool.
+    print("\nBreeding genetic mixer offspring from the ledger + seed genes...")
+    _print_report("mixer", strategy_mixer.mix_and_register(conn, histories, warnings))
+
     if warnings:
-        print("Warnings:")
+        print("\nWarnings:")
         for w in warnings:
             print("  ! " + w)
 

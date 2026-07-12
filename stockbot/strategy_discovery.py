@@ -169,9 +169,9 @@ def _clamp_rr(value) -> float:
         return 1.5
 
 
-def _safe_name(raw, conn) -> str:
-    base = re.sub(r"[^a-z0-9_]", "", str(raw or "spec").lower().replace(" ", "_"))[:32]
-    base = f"disc_{base or 'spec'}"
+def _safe_name(raw, conn, prefix: str = "disc") -> str:
+    clean = re.sub(r"[^a-z0-9_]", "", str(raw or "").lower().replace(" ", "_"))[:32]
+    base = f"{prefix}_{clean}" if clean else prefix
     name, i = base, 2
     while conn.execute("SELECT 1 FROM strategies WHERE variant_key=?", (name,)).fetchone():
         name = f"{base}_{i}"
