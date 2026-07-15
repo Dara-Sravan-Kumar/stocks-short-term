@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS run_log (
   tickers_scanned INTEGER,
   new_picks INTEGER,
   exits INTEGER,
-  warnings TEXT
+  warnings TEXT,
+  provider TEXT                       -- FYERS / YFINANCE / FYERS+YFINANCE that served this run
 );
 
 CREATE TABLE IF NOT EXISTS paper_book (
@@ -223,6 +224,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "source" not in cols:
         conn.execute("ALTER TABLE holdings ADD COLUMN source TEXT NOT NULL DEFAULT 'MOCK'")
         conn.execute("ALTER TABLE holdings ADD COLUMN synced_at TEXT")
+        conn.commit()
+
+    # Structured data-provider column so degraded (yfinance-fallback) runs are
+    # visible at a glance instead of only inferable from free-text warnings.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(run_log)")}
+    if "provider" not in cols:
+        conn.execute("ALTER TABLE run_log ADD COLUMN provider TEXT")
         conn.commit()
 
     # Widen the uniqueness locks from (ticker) to (ticker, variant) so every
@@ -487,12 +495,14 @@ def upsert_tracking(conn: sqlite3.Connection, date: str, run_slot: str, kind: st
 # ---------------------------------------------------------------------------
 
 def log_run(conn: sqlite3.Connection, run_date: str, started_at: str, finished_at: str,
-            tickers_scanned: int, new_picks: int, exits: int, warnings: list[str]) -> None:
+            tickers_scanned: int, new_picks: int, exits: int, warnings: list[str],
+            provider: str | None = None) -> None:
     conn.execute(
         """INSERT INTO run_log (run_date, started_at, finished_at, tickers_scanned,
-                                new_picks, exits, warnings) VALUES (?,?,?,?,?,?,?)""",
+                                new_picks, exits, warnings, provider)
+           VALUES (?,?,?,?,?,?,?,?)""",
         (run_date, started_at, finished_at, tickers_scanned, new_picks, exits,
-         "; ".join(warnings) if warnings else None),
+         "; ".join(warnings) if warnings else None, provider),
     )
     conn.commit()
 

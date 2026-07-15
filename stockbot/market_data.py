@@ -20,7 +20,8 @@ def today_ist() -> str:
 
 
 def fetch_history(tickers: list[str], warnings: list[str],
-                  period: str | None = None) -> dict[str, pd.DataFrame]:
+                  period: str | None = None,
+                  provider_out: dict | None = None) -> dict[str, pd.DataFrame]:
     """Daily bars per ticker: Fyers first, yfinance for the rest.
 
     period overrides config.HISTORY_PERIOD (e.g. "2y"/"5y"/"max" for a deeper
@@ -28,7 +29,15 @@ def fetch_history(tickers: list[str], warnings: list[str],
     than-default period goes straight to yfinance, which handles multi-year
     cleanly. Returns {ticker: DataFrame[Open, High, Low, Close, Volume]} keeping
     only tickers with enough clean history.
+
+    If provider_out is passed, provider_out["provider"] is set to which data
+    source actually served the run — "FYERS", "YFINANCE", or "FYERS+YFINANCE"
+    (Fyers with a yfinance gap-fill) — so run_log can flag degraded runs.
     """
+    def _record(name: str) -> None:
+        if provider_out is not None:
+            provider_out["provider"] = name
+
     period = period or config.HISTORY_PERIOD
     tickers = sorted(set(tickers))
     if not tickers:
@@ -46,8 +55,12 @@ def fetch_history(tickers: list[str], warnings: list[str],
                 warnings.append(f"Fyers missed {len(missing)} of {len(tickers)} "
                                 "tickers - filling from yfinance")
                 out.update(_fetch_yfinance(missing, warnings, period))
+                _record("FYERS+YFINANCE")
+            else:
+                _record("FYERS")
             return out
         warnings.append("Fyers returned no data - falling back to yfinance")
+    _record("YFINANCE")
     return _fetch_yfinance(tickers, warnings, period)
 
 

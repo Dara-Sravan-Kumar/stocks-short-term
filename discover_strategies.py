@@ -17,7 +17,7 @@ import sys
 from dotenv import load_dotenv
 
 import config
-from stockbot import db, market_data, strategy_discovery, strategy_mixer
+from stockbot import db, fyers_data, strategy_discovery, strategy_mixer
 
 
 def _print_report(label: str, report: dict) -> None:
@@ -44,10 +44,15 @@ def main() -> int:
           f"(existing DISCOVERED variants: "
           f"{len(db.get_active_strategies(conn, channel='DISCOVERED'))})")
 
-    print("Fetching daily history for the backtest gate...")
-    histories = market_data.fetch_history(sorted(set(config.WATCHLIST)), warnings)
+    # The discovery gate is an out-of-sample backtest, so — like the standalone
+    # backtester — it sources bars from Fyers ONLY (never yfinance) and fails loud
+    # if Fyers is unavailable, rather than gating specs on a different data feed.
+    print("Fetching daily history from Fyers for the backtest gate...")
+    histories = fyers_data.fetch_history(sorted(set(config.WATCHLIST)), warnings)
     if not histories:
-        print("FATAL: no market data - aborting discovery.")
+        print("FATAL: Fyers historical data unavailable - aborting discovery "
+              "(gate never falls back to yfinance; run fyers_login.py). "
+              "Warnings: " + "; ".join(warnings[-3:]))
         return 1
 
     print("Asking Claude for candidate published swing strategies...")

@@ -248,6 +248,36 @@ def test_open_positions_for_picks_unweighted_strategy_is_unconstrained(conn):
     assert actions[0]["action"] == "BUY"
 
 
+# ---------------------------------------------------------------------------
+# Fyers-only booking gate — paper positions may only open/close/mark on a real
+# Fyers run; a pure-yfinance fallback run FREEZES the book (no equity written).
+# ---------------------------------------------------------------------------
+
+def test_books_on_provider_gate():
+    # Real Fyers feeds (incl. minor yfinance gap-fill) book; pure fallback freezes.
+    assert paper.books_on_provider("FYERS") is True
+    assert paper.books_on_provider("FYERS+YFINANCE") is True
+    assert paper.books_on_provider("YFINANCE") is False
+    assert paper.books_on_provider(None) is False
+
+
+def test_mark_to_market_write_false_skips_equity_log(conn):
+    """A frozen (non-Fyers) run values the book but must NOT persist an equity
+    point — the curve only ever moves on real Fyers prices."""
+    warnings = []
+    paper.open_positions_for_picks(conn, [_pick("AAA.NS")], {}, "2026-07-06",
+                                   "AM", warnings)
+    summary = paper.mark_to_market(conn, {}, "2026-07-06", "AM", write=False)
+    # still returns a valued book...
+    assert summary["equity"] == pytest.approx(
+        summary["cash"] + summary["positions_value"], abs=0.01)
+    # ...but wrote no equity-curve row
+    assert conn.execute("SELECT COUNT(*) FROM paper_equity_log").fetchone()[0] == 0
+    # and a subsequent real (write=True) run does persist one
+    paper.mark_to_market(conn, {}, "2026-07-06", "PM", write=True)
+    assert conn.execute("SELECT COUNT(*) FROM paper_equity_log").fetchone()[0] == 1
+
+
 def test_mark_to_market_logs_equity_curve(conn):
     warnings = []
     paper.open_positions_for_picks(conn, [_pick("AAA.NS")], {}, "2026-07-06",

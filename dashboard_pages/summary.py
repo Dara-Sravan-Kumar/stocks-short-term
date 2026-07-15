@@ -149,12 +149,9 @@ def _fleet_snapshot(conn) -> None:
         f"{ch} {n}" for ch, n in by_channel.items()))
 
 
-def page() -> None:
-    conn = common.get_conn()
-    st.title("📊 StockBot")
-    common.last_run_caption(conn)
-    common.mode_badge()
-
+def render(conn) -> None:
+    """Body of the Summary view (no title/conn management) — reused as a tab by
+    dashboard_web.py's MCX-style 2-view layout."""
     st.header("Book at a Glance")
     if common.mode() == "LIVE":
         _live_tiles(conn)
@@ -169,4 +166,12 @@ def page() -> None:
 
     st.header("Strategy Fleet")
     _fleet_snapshot(conn)
+
+
+def page() -> None:
+    conn = common.get_conn()
+    st.title("📊 StockBot")
+    common.last_run_caption(conn)
+    common.mode_badge()
+    render(conn)
     conn.close()

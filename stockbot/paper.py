@@ -21,6 +21,20 @@ from stockbot import db
 from stockbot.indicators import Snapshot
 
 
+# Paper positions may only be OPENED / CLOSED / MARKED on a run whose data
+# source is Fyers (real NSE broker data). FYERS and FYERS+YFINANCE (Fyers with a
+# minor yfinance gap-fill) count as real; a pure YFINANCE fallback FREEZES the
+# book — signals still scan/alert, but nothing books and the equity curve isn't
+# written. (Mirrors mcxbot's mcx_live gate.)
+REAL_FYERS_PROVIDERS = ("FYERS", "FYERS+YFINANCE")
+
+
+def books_on_provider(provider: str | None) -> bool:
+    """True when `provider` (from market_data.fetch_history's provider_out) is a
+    real Fyers feed the paper book may open/close/mark on; False freezes it."""
+    return provider in REAL_FYERS_PROVIDERS
+
+
 def _pct(x: float) -> float:
     return x / 100.0
 
@@ -275,8 +289,13 @@ def close_positions_for_exits(conn: sqlite3.Connection, closed_picks: list[dict]
 
 
 def mark_to_market(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
-                   run_date: str, run_slot: str) -> dict:
-    """Value the book at today's closes and log the equity curve point."""
+                   run_date: str, run_slot: str, write: bool = True) -> dict:
+    """Value the book at today's closes and log the equity curve point.
+
+    write=False values and returns the book WITHOUT persisting the equity-curve
+    point. run_daily.py uses this on frozen (non-Fyers) runs so the equity curve
+    is never written from fallback (yfinance) prices — only real Fyers runs move
+    the book. (Mirrors mcxbot/paper.py's proxy-run guard.)"""
     book = db.get_paper_book(conn)
     positions = []
     positions_value = 0.0
@@ -298,10 +317,11 @@ def mark_to_market(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
         })
     realized_cum = db.get_realized_pnl_cum(conn)
     equity = book["cash"] + positions_value
-    db.upsert_paper_equity(conn, run_date, run_slot, round(book["cash"], 2),
-                           round(positions_value, 2), round(equity, 2),
-                           round(unrealized, 2), round(realized_cum, 2),
-                           len(positions))
+    if write:
+        db.upsert_paper_equity(conn, run_date, run_slot, round(book["cash"], 2),
+                               round(positions_value, 2), round(equity, 2),
+                               round(unrealized, 2), round(realized_cum, 2),
+                               len(positions))
     return {
         "starting_cash": book["starting_cash"], "cash": round(book["cash"], 2),
         "positions_value": round(positions_value, 2), "equity": round(equity, 2),

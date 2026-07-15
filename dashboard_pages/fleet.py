@@ -184,18 +184,14 @@ def _backtest_runner():
                      color=common.SERIES[0])
 
 
-def page() -> None:
-    conn = common.get_conn()
-    st.title("🛰️ Fleet Analysis")
-    common.last_run_caption(conn)
-
+def render(conn) -> None:
+    """Body of the Fleet Analysis view (no title/conn management)."""
     ledger_stats = db.get_strategy_ledger_stats(conn)
     weights = strategy_engine.current_capital_weights(conn)
     active = [s for ch in _CHANNELS for s in db.get_active_strategies(conn, channel=ch)]
 
     if not active:
         st.info("No active strategies yet.")
-        conn.close()
         return
 
     _overview(active, ledger_stats)
@@ -203,7 +199,12 @@ def page() -> None:
     _per_channel(active, ledger_stats, weights)
     _variant_table(active, ledger_stats, weights)
     st.divider()
-    _discovered_spotlight(active, ledger_stats)
-    st.divider()
     _backtest_runner()
+
+
+def page() -> None:
+    conn = common.get_conn()
+    st.title("🛰️ Fleet Analysis")
+    common.last_run_caption(conn)
+    render(conn)
     conn.close()

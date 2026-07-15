@@ -91,6 +91,71 @@ def test_short_history_skipped_with_warning(monkeypatch):
     assert out == {} and any("only 3 Fyers bars" in w for w in warnings)
 
 
+# ------------------------------------------------- chunked range (backtester)
+def test_fetch_history_range_chunks_and_concatenates(monkeypatch):
+    """A multi-year window is split into <=FYERS_HISTORY_DAYS requests (Fyers'
+    ~366-day cap) and stitched back into one de-duplicated frame."""
+    monkeypatch.setattr(fyers_data, "ensure_token",
+                        lambda creds, w, force_refresh=False: "tok")
+    monkeypatch.setattr(fyers_data, "resolve_symbols",
+                        lambda tickers, w: {"TCS.NS": "NSE:TCS-EQ"})
+    monkeypatch.setattr(config, "MIN_HISTORY_BARS", 5)
+    monkeypatch.setattr(config, "FYERS_HISTORY_DAYS", 360)
+
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append(params)
+        # each chunk returns candles dated inside its own [range_from, range_to]
+        start = datetime.fromisoformat(params["range_from"])
+        n = 20
+
+        class R:
+            status_code = 200
+            def json(self):
+                return {"s": "ok", "candles": [
+                    [int((start + timedelta(days=i)).timestamp()),
+                     100, 102, 98, 101, 1000] for i in range(n)]}
+        return R()
+
+    monkeypatch.setattr(fyers_data.requests, "get", fake_get)
+    warnings = []
+    out = fyers_data.fetch_history_range(["TCS.NS"], warnings, days=800)
+    # 800 days / 360-day cap => 3 chunked requests
+    assert len(calls) == 3
+    # no chunk exceeds the ~366-day per-request cap
+    for p in calls:
+        span = (datetime.fromisoformat(p["range_to"])
+                - datetime.fromisoformat(p["range_from"])).days
+        assert span <= 366
+    df = out["TCS.NS"]
+    assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert df.index.is_monotonic_increasing and not df.index.has_duplicates
+
+
+# ------------------------------------------------------------ token refresh
+def test_refresh_reports_sebi_disabled_on_code_minus_16(monkeypatch):
+    """SEBI killed validate-refresh-token (HTTP 400 code -16): the warning must
+    say a fresh daily login is needed, not the old '~15 days' text."""
+    class FakeResp:
+        status_code = 400
+        def json(self):
+            return {"s": "error", "code": -16,
+                    "message": "Refresh token API is currently disabled to "
+                               "comply with SEBI regulations"}
+
+    monkeypatch.setattr(fyers_data.requests, "post", lambda *a, **k: FakeResp())
+    creds = {"app_id": "AB01234-100", "secret_id": "SECRET", "pin": "1234"}
+    cache = {"refresh_token": "rtok"}
+    warnings = []
+    out = fyers_data.refresh_access_token(creds, cache, warnings)
+    assert out is None
+    assert len(warnings) == 1
+    assert "disabled by SEBI" in warnings[0]
+    assert "fyers_login.py" in warnings[0]
+    assert "15 days" not in warnings[0]
+
+
 # ----------------------------------------------------------------- dispatch
 def test_market_data_prefers_fyers_and_fills_gaps(monkeypatch):
     monkeypatch.setenv("FYERS_APP_ID", "AB01234-100")
@@ -126,6 +191,54 @@ def test_market_data_skips_fyers_without_creds(monkeypatch):
     monkeypatch.setattr(market_data, "_fetch_yfinance",
                         lambda tickers, w, period=None: {t: "YF_DF" for t in tickers})
     assert market_data.fetch_history(["TCS.NS"], []) == {"TCS.NS": "YF_DF"}
+
+
+# --------------------------------------------------------- provider visibility
+def test_provider_out_records_fyers_with_yfinance_fill(monkeypatch):
+    monkeypatch.setenv("FYERS_APP_ID", "AB01234-100")
+    monkeypatch.setenv("FYERS_SECRET_ID", "SECRET")
+    monkeypatch.setattr(market_data.fyers_data, "fetch_history",
+                        lambda tickers, w: {"TCS.NS": "FYERS_DF"})
+    monkeypatch.setattr(market_data, "_fetch_yfinance",
+                        lambda tickers, w, period=None: {t: "YF_DF" for t in tickers})
+    meta = {}
+    market_data.fetch_history(["TCS.NS", "INFY.NS"], [], provider_out=meta)
+    assert meta["provider"] == "FYERS+YFINANCE"
+
+
+def test_provider_out_records_pure_fyers(monkeypatch):
+    monkeypatch.setenv("FYERS_APP_ID", "AB01234-100")
+    monkeypatch.setenv("FYERS_SECRET_ID", "SECRET")
+    monkeypatch.setattr(market_data.fyers_data, "fetch_history",
+                        lambda tickers, w: {t: "FYERS_DF" for t in tickers})
+    monkeypatch.setattr(market_data, "_fetch_yfinance",
+                        lambda tickers, w, period=None: pytest.fail("no fill expected"))
+    meta = {}
+    market_data.fetch_history(["TCS.NS"], [], provider_out=meta)
+    assert meta["provider"] == "FYERS"
+
+
+def test_provider_out_records_yfinance_fallback(monkeypatch):
+    monkeypatch.setenv("FYERS_APP_ID", "AB01234-100")
+    monkeypatch.setenv("FYERS_SECRET_ID", "SECRET")
+    monkeypatch.setattr(market_data.fyers_data, "fetch_history", lambda tickers, w: {})
+    monkeypatch.setattr(market_data, "_fetch_yfinance",
+                        lambda tickers, w, period=None: {t: "YF_DF" for t in tickers})
+    meta = {}
+    market_data.fetch_history(["TCS.NS"], [], provider_out=meta)
+    assert meta["provider"] == "YFINANCE"
+
+
+def test_run_log_records_provider(monkeypatch, tmp_path):
+    from stockbot import db
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "t.db")
+    conn = db.connect()
+    db.log_run(conn, "2026-07-15", "2026-07-15T09:00:00", "2026-07-15T09:05:00",
+               120, 3, 1, ["Fyers returned no data - falling back to yfinance"],
+               provider="YFINANCE")
+    row = db.get_last_run(conn)
+    assert row["provider"] == "YFINANCE"
+    conn.close()
 
 
 # ----------------------------------------------------------------- holdings

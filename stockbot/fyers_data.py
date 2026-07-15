@@ -5,10 +5,15 @@ equities: no expiry resolution — a yfinance-style ticker "TCS.NS" maps to the
 Fyers symbol "NSE:TCS-EQ", validated against Fyers' NSE_CM symbol master
 (cached daily in data/) so series exceptions like -BE resolve correctly.
 
-Auth model (shared with mcx-short-term — ONE app, ONE active token):
-- Bootstrap (~every 15 days): run `python fyers_login.py` in either project.
-- Tokens live at FYERS_TOKEN_PATH (shared file); the daily access token is
-  auto-refreshed here with the refresh token + FYERS_PIN when stale.
+Auth model (shared with mcx-short-term — ONE app, ONE active token; SEBI reality):
+- Fyers DISABLED programmatic token refresh: validate-refresh-token now returns
+  code -16 ("disabled to comply with SEBI regulations"), so the daily access
+  token CANNOT be auto-refreshed by the bot. There is NO auto-refresh fallback —
+  a fresh interactive daily login is required: run `python fyers_login.py` in
+  either project each trading day.
+- Tokens live at FYERS_TOKEN_PATH (shared file); once the cached token is stale
+  it cannot be renewed here — the run warns and market_data.py falls back to
+  yfinance (equities are scale-safe, so booking continues on fallback).
 
 Scale: ~500 per-symbol history calls per run, so requests go through a
 ThreadPoolExecutor throttled to ~170 calls/min (Fyers data-API limit is
@@ -72,7 +77,13 @@ def save_token_cache(cache: dict) -> None:
 
 def refresh_access_token(creds: dict, cache: dict,
                          warnings: list[str]) -> dict | None:
-    """Mint a fresh daily access token from the ~15-day refresh token."""
+    """Attempt to mint a fresh daily access token from the refresh token.
+
+    NOTE: Fyers has permanently DISABLED this endpoint to comply with SEBI
+    regulations (validate-refresh-token returns HTTP 400, code -16), so in
+    practice this always fails and the caller falls back to yfinance. Kept so a
+    single, accurate warning is emitted rather than a silent dead code path.
+    """
     if not cache.get("refresh_token"):
         warnings.append("Fyers: no refresh token cached - run fyers_login.py")
         return None
@@ -90,8 +101,14 @@ def refresh_access_token(creds: dict, cache: dict,
             timeout=config.FYERS_TIMEOUT)
         data = resp.json()
         if resp.status_code >= 400 or data.get("s") != "ok" or not data.get("access_token"):
-            warnings.append(f"Fyers token refresh failed ({data.get('message', resp.status_code)}) "
-                            "- if the refresh token expired (~15 days), run fyers_login.py")
+            if data.get("code") == -16 or resp.status_code == 400:
+                # SEBI: validate-refresh-token is permanently disabled — no
+                # amount of retrying refreshes the token. Only a fresh login can.
+                warnings.append("Fyers refresh-token API disabled by SEBI — a full "
+                                "daily re-login (fyers_login.py) is required")
+            else:
+                warnings.append(f"Fyers token refresh failed ({data.get('message', resp.status_code)}) "
+                                "- run fyers_login.py to re-authorize")
             return None
     except Exception as exc:
         warnings.append(f"Fyers token refresh failed ({exc})")
@@ -184,10 +201,16 @@ def resolve_symbols(tickers: list[str],
 # ------------------------------------------------------------------- candles
 def _fetch_candles(symbol: str, app_id: str, token: str,
                    throttle: _Throttle, warnings: list[str],
-                   label: str) -> pd.DataFrame | None | str:
-    """Returns a DataFrame, None on failure, or "AUTH" on HTTP 401."""
-    to_date = datetime.now().date()
-    from_date = to_date - timedelta(days=config.FYERS_HISTORY_DAYS)
+                   label: str, from_date=None,
+                   to_date=None) -> pd.DataFrame | None | str:
+    """Returns a DataFrame, None on failure, or "AUTH" on HTTP 401.
+
+    from_date/to_date bound a single request; both default to the trailing
+    FYERS_HISTORY_DAYS window (a single sub-366-day request). The backtester
+    passes explicit windows via _fetch_candles_chunked to walk multi-year spans.
+    """
+    to_date = to_date or datetime.now().date()
+    from_date = from_date or (to_date - timedelta(days=config.FYERS_HISTORY_DAYS))
     params = {
         "symbol": symbol,
         "resolution": "D",
@@ -285,29 +308,48 @@ def fetch_quotes(tickers: list[str], warnings: list[str]) -> dict[str, dict]:
     return out
 
 
-def fetch_history(tickers: list[str],
-                  warnings: list[str]) -> dict[str, pd.DataFrame]:
-    """{ticker: DataFrame[Open, High, Low, Close, Volume]} of daily NSE bars."""
-    creds = config.fyers_settings()
-    token = ensure_token(creds, warnings)
-    if token is None:
-        return {}
-    symbols = resolve_symbols(sorted(set(tickers)), warnings)
-    if not symbols:
-        return {}
-    throttle = _Throttle(config.FYERS_MIN_CALL_GAP)
+def _fetch_candles_chunked(symbol: str, app_id: str, token: str,
+                           throttle: _Throttle, warnings: list[str], label: str,
+                           total_days: int) -> pd.DataFrame | None | str:
+    """`total_days` calendar days of daily candles, walked in <=FYERS_HISTORY_DAYS
+    chunks (Fyers caps a single /history request at ~366 days) and concatenated.
+    Returns a DataFrame, None on total failure, or "AUTH" on an auth error in the
+    first chunk. Empty intermediate chunks (e.g. before a symbol's listing date)
+    are quietly skipped; only a fully empty span surfaces a warning."""
+    cap = config.FYERS_HISTORY_DAYS
+    to_date = datetime.now().date()
+    cursor = to_date - timedelta(days=max(total_days, 1))
+    frames: list[pd.DataFrame] = []
+    scratch: list[str] = []
+    while cursor <= to_date:
+        chunk_to = min(cursor + timedelta(days=cap - 1), to_date)
+        df = _fetch_candles(symbol, app_id, token, throttle, scratch, label,
+                            from_date=cursor, to_date=chunk_to)
+        if isinstance(df, str):  # AUTH — surface immediately so the caller refreshes
+            return df
+        if isinstance(df, pd.DataFrame) and len(df):
+            frames.append(df)
+        cursor = chunk_to + timedelta(days=1)
+    if not frames:
+        warnings.extend(scratch[:1])  # one representative failure, not one per chunk
+        return None
+    combined = pd.concat(frames)
+    return combined[~combined.index.duplicated(keep="last")].sort_index()
 
-    # Probe with one symbol so a dead token is refreshed ONCE, up front,
-    # instead of 500 workers all hitting 401 in parallel.
+
+def _fan_out(symbols: dict[str, str], creds: dict, token: str,
+             warnings: list[str], fetch_one) -> dict[str, pd.DataFrame]:
+    """Probe one symbol first so a dead token is refreshed ONCE up front (not by
+    N workers all hitting 401 in parallel), then fetch the rest concurrently.
+    fetch_one(symbol, token, label) -> DataFrame | None | "AUTH". Tickers with
+    fewer than MIN_HISTORY_BARS bars are dropped with a warning."""
     probe_ticker, probe_symbol = next(iter(symbols.items()))
-    probe = _fetch_candles(probe_symbol, creds["app_id"], token, throttle,
-                           warnings, probe_ticker)
+    probe = fetch_one(probe_symbol, token, probe_ticker)
     if isinstance(probe, str):  # AUTH
         token = ensure_token(creds, warnings, force_refresh=True)
         if token is None:
             return {}
-        probe = _fetch_candles(probe_symbol, creds["app_id"], token, throttle,
-                               warnings, probe_ticker)
+        probe = fetch_one(probe_symbol, token, probe_ticker)
         if isinstance(probe, str):
             warnings.append("Fyers: auth still failing after refresh - no data")
             return {}
@@ -319,7 +361,7 @@ def fetch_history(tickers: list[str],
 
     def worker(item: tuple[str, str]) -> tuple[str, pd.DataFrame | None]:
         t, s = item
-        df = _fetch_candles(s, creds["app_id"], token, throttle, warnings, t)
+        df = fetch_one(s, token, t)
         if isinstance(df, str):  # rare mid-run auth blip: count as a failure
             warnings.append(f"{t}: Fyers auth error mid-run - skipped")
             return t, None
@@ -335,3 +377,43 @@ def fetch_history(tickers: list[str],
             warnings.append(f"{t}: only {len(out[t])} Fyers bars - skipped")
             del out[t]
     return out
+
+
+def fetch_history(tickers: list[str],
+                  warnings: list[str]) -> dict[str, pd.DataFrame]:
+    """{ticker: DataFrame[Open, High, Low, Close, Volume]} of daily NSE bars
+    over the trailing FYERS_HISTORY_DAYS window (the daily-run depth)."""
+    creds = config.fyers_settings()
+    token = ensure_token(creds, warnings)
+    if token is None:
+        return {}
+    symbols = resolve_symbols(sorted(set(tickers)), warnings)
+    if not symbols:
+        return {}
+    throttle = _Throttle(config.FYERS_MIN_CALL_GAP)
+    return _fan_out(
+        symbols, creds, token, warnings,
+        lambda sym, tok, label: _fetch_candles(sym, creds["app_id"], tok,
+                                               throttle, warnings, label))
+
+
+def fetch_history_range(tickers: list[str], warnings: list[str],
+                        days: int) -> dict[str, pd.DataFrame]:
+    """{ticker: DataFrame} of daily NSE bars going back ~`days` calendar days,
+    chunked to respect Fyers' ~366-day per-request cap. This is the backtester's
+    history source: the backtest MUST run on the same real Fyers feed that books
+    live trades, so it never falls back to yfinance. An empty return means Fyers
+    was unavailable — the caller FAILS LOUD rather than silently substituting a
+    different data source."""
+    creds = config.fyers_settings()
+    token = ensure_token(creds, warnings)
+    if token is None:
+        return {}
+    symbols = resolve_symbols(sorted(set(tickers)), warnings)
+    if not symbols:
+        return {}
+    throttle = _Throttle(config.FYERS_MIN_CALL_GAP)
+    return _fan_out(
+        symbols, creds, token, warnings,
+        lambda sym, tok, label: _fetch_candles_chunked(
+            sym, creds["app_id"], tok, throttle, warnings, label, days))

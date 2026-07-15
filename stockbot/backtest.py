@@ -211,16 +211,36 @@ def run_backtest(histories: dict[str, pd.DataFrame], variants: list[dict],
     return {b.variant["variant_key"]: _report(b, eval_dates) for b in books}
 
 
+# period label -> calendar-day floor, so a small `days` with a long `period`
+# still pulls the deeper span the caller asked for. Depth is otherwise derived
+# from the replay window itself (see _lookback_days).
+_PERIOD_DAYS = {"6mo": 190, "1y": 400, "2y": 760, "3y": 1120, "5y": 1850,
+                "max": 3800}
+
+
+def _lookback_days(days: int, period: str | None) -> int:
+    """Calendar days of Fyers history to fetch for a `days`-session replay.
+    ~1.5x the (replay window + indicator warm-up) covers weekends/holidays, and
+    a `period` label raises a floor for deep on-demand runs."""
+    from_replay = int((days + config.MIN_HISTORY_BARS) * 1.5) + 10
+    return max(from_replay, _PERIOD_DAYS.get(period or "", 0))
+
+
 def run_and_save(days: int = 120, tickers_cap: int | None = None,
                  channels: list[str] | None = None, capital: float = 100_000.0,
                  seeds_only: bool = False, period: str | None = None,
                  warnings: list | None = None, progress=None) -> dict:
     """Full fleet backtest: load universe, fetch history, replay, and write the
     result JSON to data/backtests/. Shared by the CLI (backtest.py) and the
-    dashboard's Run button. `period` overrides the history depth fetched (e.g.
-    "3y" for a multi-year replay). Returns the saved payload (plus 'path', or
-    'error')."""
-    from stockbot import db, market_data
+    dashboard's Run button. `period` raises a floor on the history depth fetched
+    (e.g. "3y" for a multi-year replay). Returns the saved payload (plus 'path',
+    or 'error').
+
+    History comes from Fyers /history ONLY (free, authorized daily NSE candles),
+    chunked to respect the ~366-day per-request cap, so backtest edge is measured
+    on the SAME feed that books live trades. If Fyers is unavailable the run
+    FAILS LOUD ('error' set) rather than silently backtesting on yfinance."""
+    from stockbot import db, fyers_data
     warnings = warnings if warnings is not None else []
     conn = db.connect()
     try:
@@ -233,9 +253,13 @@ def run_and_save(days: int = 120, tickers_cap: int | None = None,
     finally:
         conn.close()
 
-    histories = market_data.fetch_history(tickers, warnings, period=period)
+    lookback = _lookback_days(days, period)
+    histories = fyers_data.fetch_history_range(tickers, warnings, lookback)
     if not histories:
-        return {"error": "no market data available", "results": {}}
+        return {"error": "Fyers historical data unavailable — backtest aborted "
+                "(backtests never fall back to yfinance; run fyers_login.py to "
+                "authorize a fresh daily token). Last warnings: "
+                + " | ".join(warnings[-3:]), "results": {}}
     results = run_backtest(histories, variants, days, capital, progress=progress)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -108,11 +108,8 @@ def _retired(conn) -> None:
             width="stretch", hide_index=True)
 
 
-def page() -> None:
-    conn = common.get_conn()
-    st.title("📒 Strategy Ledger")
-    common.last_run_caption(conn)
-
+def render(conn) -> None:
+    """Body of the Strategy Ledger view (no title/conn management)."""
     st.caption(f"Fleets evolve automatically: a variant retires below "
                f"{config.STRATEGY_RETIREMENT_WIN_RATE_FLOOR:.0f}% win rate after "
                f"{config.STRATEGY_MIN_TRADES_FOR_RETIREMENT} closed trades and is "
@@ -124,4 +121,11 @@ def page() -> None:
     fleet = _fleet_table(conn)
     _variant_drilldown(conn, fleet)
     _retired(conn)
+
+
+def page() -> None:
+    conn = common.get_conn()
+    st.title("📒 Strategy Ledger")
+    common.last_run_caption(conn)
+    render(conn)
     conn.close()

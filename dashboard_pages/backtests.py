@@ -11,8 +11,8 @@ import config
 from dashboard_pages import common
 
 
-def page() -> None:
-    st.title("🧪 Backtest")
+def render() -> None:
+    """Body of the Backtest view (reads data/backtests/*.json; no title)."""
     bt_dir = Path(config.DATA_DIR) / "backtests"
     bt_files = sorted(bt_dir.glob("backtest_*.json"), reverse=True)
     if not bt_files:
@@ -68,3 +68,8 @@ def page() -> None:
             st.dataframe(trades, width="stretch", hide_index=True)
     with st.expander("Variant parameters"):
         st.json(r["params"])
+
+
+def page() -> None:
+    st.title("🧪 Backtest")
+    render()

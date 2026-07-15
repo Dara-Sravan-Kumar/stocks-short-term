@@ -116,13 +116,18 @@ def _live_book(conn) -> None:
         st.caption("No broker syncs logged yet.")
 
 
+def render(conn) -> None:
+    """Body of the Book view (mode-aware; no title/conn management)."""
+    if common.mode() == "LIVE":
+        _live_book(conn)
+    else:
+        _paper_book(conn)
+
+
 def page() -> None:
     conn = common.get_conn()
     st.title("💼 Book")
     common.last_run_caption(conn)
     common.mode_badge()
-    if common.mode() == "LIVE":
-        _live_book(conn)
-    else:
-        _paper_book(conn)
+    render(conn)
     conn.close()

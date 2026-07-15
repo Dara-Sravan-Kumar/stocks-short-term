@@ -87,3 +87,64 @@ def test_build_variant_list_seeds_only():
                                                            "PULLBACK"])
     keys = {v["variant_key"] for v in variants}
     assert keys == {"TECHNICAL_seed", "PULLBACK_seed"}
+
+
+# ---------------------------------------------------------------------------
+# Fyers-only history source — the backtester fetches bars from Fyers /history
+# and FAILS LOUD if Fyers is unavailable (never silently falls back to yfinance).
+# ---------------------------------------------------------------------------
+
+def test_lookback_days_covers_replay_plus_warmup():
+    # enough calendar days for the replay window + indicator warm-up bars
+    assert backtest._lookback_days(120, None) >= 120 + config.MIN_HISTORY_BARS
+    # a period label raises a floor for deep on-demand runs
+    assert backtest._lookback_days(60, "5y") >= 1850
+
+
+def test_run_and_save_sources_from_fyers(monkeypatch, tmp_path):
+    """run_and_save must pull history from fyers_data.fetch_history_range, never
+    from yfinance/market_data."""
+    from stockbot import fyers_data, market_data
+    monkeypatch.setattr(config, "WATCHLIST", ["TCS.NS"])
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backtest, "build_variant_list",
+                        lambda conn, channels=None: [_variant()])
+    from stockbot import universe as universe_mod
+    monkeypatch.setattr(universe_mod, "load", lambda conn, w, **k: {"source": "test"})
+    monkeypatch.setattr(universe_mod, "apply", lambda uni: None)
+    # market_data (yfinance path) must NOT be consulted
+    monkeypatch.setattr(market_data, "fetch_history",
+                        lambda *a, **k: pytest.fail("backtest must not use yfinance"))
+    df = _df([100.0] * 80)
+    seen = {}
+
+    def fake_range(tickers, warnings, days):
+        seen["days"] = days
+        return {"TCS.NS": df}
+    monkeypatch.setattr(fyers_data, "fetch_history_range", fake_range)
+
+    payload = backtest.run_and_save(days=30, tickers_cap=1, warnings=[])
+    assert "error" not in payload
+    assert seen["days"] >= 30            # a real lookback window was requested
+    assert payload["tickers"] == 1
+
+
+def test_run_and_save_fails_loud_without_fyers(monkeypatch, tmp_path):
+    """If Fyers returns nothing, the backtest aborts with an explicit error —
+    it does not quietly backtest on a different data feed."""
+    from stockbot import fyers_data, market_data
+    monkeypatch.setattr(config, "WATCHLIST", ["TCS.NS"])
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backtest, "build_variant_list",
+                        lambda conn, channels=None: [_variant()])
+    from stockbot import universe as universe_mod
+    monkeypatch.setattr(universe_mod, "load", lambda conn, w, **k: {"source": "test"})
+    monkeypatch.setattr(universe_mod, "apply", lambda uni: None)
+    monkeypatch.setattr(market_data, "fetch_history",
+                        lambda *a, **k: pytest.fail("must not fall back to yfinance"))
+    monkeypatch.setattr(fyers_data, "fetch_history_range",
+                        lambda tickers, warnings, days: {})
+
+    payload = backtest.run_and_save(days=30, tickers_cap=1, warnings=[])
+    assert payload["results"] == {}
+    assert "Fyers" in payload["error"] and "yfinance" in payload["error"]

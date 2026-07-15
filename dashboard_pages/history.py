@@ -94,11 +94,8 @@ def _run_log(conn) -> None:
     st.dataframe(runs, width="stretch", hide_index=True)
 
 
-def page() -> None:
-    conn = common.get_conn()
-    st.title("📜 History")
-    common.last_run_caption(conn)
-
+def render(conn) -> None:
+    """Body of the History view (no title/conn management)."""
     st.header("Equity Curve")
     _equity(conn)
     st.header("Realized P&L by Strategy")
@@ -109,4 +106,11 @@ def page() -> None:
     _closed_picks(conn)
     st.header("Run Log")
     _run_log(conn)
+
+
+def page() -> None:
+    conn = common.get_conn()
+    st.title("📜 History")
+    common.last_run_caption(conn)
+    render(conn)
     conn.close()

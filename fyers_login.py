@@ -1,10 +1,11 @@
-"""One-time (and roughly fortnightly) Fyers auth bootstrap.
+"""Daily Fyers auth login.
 
-Fyers access tokens expire daily; refresh tokens last ~15 days. The bot
-auto-refreshes the daily access token on every run (see
-mcxbot/data_providers/fyers.py), so you only need to run THIS script when the
-refresh token itself dies — i.e. after first setup and then every ~15 days
-(the bot's warnings will tell you when).
+Fyers access tokens expire daily, and Fyers has DISABLED programmatic token
+refresh to comply with SEBI regulations (validate-refresh-token returns code
+-16), so there is NO auto-refresh: the bot cannot renew the token itself. A
+fresh interactive login is required each trading day — run THIS script (the
+bot's warnings will tell you when the cached token has gone stale). Without a
+current token the run falls back to yfinance data.
 
 Prerequisites (once, at https://myapi.fyers.in):
 1. Create an app -> note the App ID (like "AB01234-100") and Secret ID.
@@ -37,8 +38,9 @@ def main() -> int:
               "at https://myapi.fyers.in and fill them in first.")
         return 1
     if not creds["pin"]:
-        print("WARNING: FYERS_PIN is empty in .env - without it the bot cannot "
-              "auto-refresh the daily access token.")
+        print("NOTE: FYERS_PIN is empty in .env. That is fine — programmatic "
+              "refresh is disabled by SEBI, so the bot no longer uses the PIN; "
+              "enter your PIN in the browser login below instead.")
 
     auth_url = (f"{config.FYERS_API_BASE}/generate-authcode"
                 f"?client_id={quote_plus(creds['app_id'])}"
@@ -75,9 +77,9 @@ def main() -> int:
         "issued": datetime.now().strftime("%Y-%m-%d"),
     })
     print("\nSuccess - tokens saved to data/fyers_token.json.")
-    print("The bot will now use Fyers for real MCX candles and auto-refresh")
-    print("the access token daily. Re-run this script when the refresh token")
-    print("expires (~15 days; the bot's run warnings will say so).")
+    print("The bot will use Fyers for real NSE candles for the rest of today.")
+    print("Fyers/SEBI disabled programmatic refresh, so re-run this script each")
+    print("trading day once the token goes stale (the bot's warnings will say so).")
     return 0
 
 

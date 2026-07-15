@@ -92,11 +92,35 @@ def main() -> int:
     universe = sorted(set(config.WATCHLIST) | set(active) | set(held))
 
     print(f"Fetching daily history for {len(universe)} NSE tickers...")
-    histories = market_data.fetch_history(universe, warnings)
+    provider_meta: dict = {}
+    histories = market_data.fetch_history(universe, warnings, provider_out=provider_meta)
     if not histories:
         print("FATAL: no market data available - aborting run.")
         return 1
+    data_provider = provider_meta.get("provider")
+    print(f"Data provider: {data_provider}")
     data_date = market_data.latest_bar_date(histories)
+
+    # Paper positions may only be OPENED / CLOSED / MARKED on a run whose data
+    # source is Fyers (real NSE broker data). FYERS and FYERS+YFINANCE (Fyers
+    # with a minor yfinance gap-fill) count as real; a pure YFINANCE fallback run
+    # FREEZES the book — signals are still scanned and alerted, but no position is
+    # opened, closed, or marked, and the equity curve is not written. This mirrors
+    # mcxbot's mcx_live gate: the book only ever moves on the real broker feed, so
+    # a degraded-data run can never phantom-book or mis-mark it.
+    book_live = paper.books_on_provider(data_provider)
+    if not book_live:
+        warnings.append(
+            f"Paper book FROZEN this run: no real Fyers data (provider "
+            f"{data_provider}) — run fyers_login.py so real NSE prices book "
+            "trades. Signals still scanned/alerted; no positions opened, closed, "
+            "or marked, and the equity curve is not written this run.")
+        print("Paper book FROZEN — provider is not Fyers; scanning/alerting only.")
+        # Nudge the operator to run the daily Fyers login (hourly-throttled so the
+        # 30-min scans don't spam the channel). Respects --no-discord.
+        if not args.no_discord:
+            reminder = discord_alerts.send_login_reminder(warnings)
+            print(f"Fyers login reminder: {reminder}")
 
     snapshots = {}
     for ticker, df in histories.items():
@@ -164,9 +188,11 @@ def main() -> int:
     print("Evaluating active picks for exit signals...")
     closed = exits.evaluate_active_picks(conn, snapshots, histories, sentiments,
                                          run_date, warnings)
-    # paper exits BEFORE new entries so freed cash is available for sizing
-    paper_exits = paper.close_positions_for_exits(conn, closed, run_date,
-                                                  run_slot, warnings)
+    # paper exits BEFORE new entries so freed cash is available for sizing —
+    # only on a real-Fyers run (see book_live gate above); frozen otherwise.
+    paper_exits = (paper.close_positions_for_exits(conn, closed, run_date,
+                                                   run_slot, warnings)
+                   if book_live else [])
 
     # ----------------------------------------------------------- strategy fleet
     # Retire underperforming/stalled TECHNICAL & PULLBACK variants (backfilling
@@ -222,9 +248,10 @@ def main() -> int:
                                                      run_date, warnings)
 
     new_picks = news_picks + tech_picks + pullback_picks + smc_picks + discovered_picks
-    paper_entries = paper.open_positions_for_picks(
+    paper_entries = (paper.open_positions_for_picks(
         conn, new_picks, snapshots, run_date, run_slot, warnings,
         capital_weights=strategy_ledger["capital_weights"])
+        if book_live else [])
     # mirror paper orders into OpenAlgo's sandbox UI (SELLs first, then BUYs;
     # hard-gated on analyzer mode so nothing can reach the real broker)
     mirrored = broker.mirror_paper_orders(paper_exits + paper_entries, warnings)
@@ -259,7 +286,11 @@ def main() -> int:
     print("Running holdings health check...")
     holdings_report = portfolio.health_check(conn, snapshots, sentiments, warnings)
     stats = db.get_closed_picks_stats(conn)
-    paper_book = paper.mark_to_market(conn, snapshots, run_date, run_slot)
+    # On frozen (non-Fyers) runs, value the book at entry fills (no snapshots) and
+    # do NOT write the equity curve — fallback prices must never move the book.
+    paper_book = (paper.mark_to_market(conn, snapshots, run_date, run_slot)
+                  if book_live
+                  else paper.mark_to_market(conn, {}, run_date, run_slot, write=False))
     holdings_provenance = db.get_holdings_provenance(conn)
 
     # ------------------------------------------------- tracking history log
@@ -339,10 +370,10 @@ def main() -> int:
     # dashboard already out), reuses the histories already fetched, and is fully
     # guarded so a discovery failure can never break the trading run. New specs
     # are live for the next morning's run.
-    if run_slot == "PM" and not args.skip_news and use_llm:
+    if run_slot == "PM" and not args.skip_news and use_llm and book_live:
         try:
             from stockbot import strategy_discovery, strategy_mixer
-            print("Running daily strategy discovery + mixing...")
+            print("Running daily strategy discovery + mixing (Fyers data)...")
             disc = strategy_discovery.discover_and_register(conn, histories, warnings)
             mix = strategy_mixer.mix_and_register(conn, histories, warnings)
             print(f"  Discovery: {len(disc['registered'])}/{disc['proposed']} registered; "
@@ -351,7 +382,8 @@ def main() -> int:
             warnings.append(f"strategy discovery/mixing failed: {exc}")
 
     db.log_run(conn, run_date, started_at, datetime.now().isoformat(timespec="seconds"),
-               len(histories), len(new_picks), len(closed), warnings)
+               len(histories), len(new_picks), len(closed), warnings,
+               provider=data_provider)
     conn.close()
     return 0
 

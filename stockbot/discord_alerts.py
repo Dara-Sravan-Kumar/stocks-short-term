@@ -17,6 +17,7 @@ BLUE = 0x3498DB
 PURPLE = 0x9B59B6
 GREY = 0x95A5A6
 GOLD = 0xF1C40F
+ORANGE = 0xE67E22
 
 _LEVEL_EMOJI = {"green": ":green_circle:", "yellow": ":yellow_circle:", "red": ":red_circle:"}
 
@@ -53,6 +54,50 @@ def _post(token: str, channel_id: str, payload: dict, warnings: list[str]) -> bo
     except requests.RequestException as exc:
         warnings.append(f"Discord post failed: {exc}")
         return False
+
+
+_LOGIN_REMINDER_STATE = config.DATA_DIR / ".login_reminder_sent"
+
+
+def send_login_reminder(warnings: list[str], throttle_minutes: int = 60) -> str:
+    """Hourly-throttled "Fyers login missing" nudge, sent when a run finds the
+    paper book FROZEN (no fresh Fyers token, so paper.books_on_provider() is
+    False and nothing books). Posts to the HOLDINGS channel if set, else PICKS.
+    Throttled to one post per `throttle_minutes` (via a small state file in this
+    bot's data dir) so the 30-min scans don't spam. Returns a short status
+    string (sent / throttled / unconfigured / failed)."""
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    try:
+        if _LOGIN_REMINDER_STATE.exists():
+            last = datetime.fromisoformat(
+                _LOGIN_REMINDER_STATE.read_text(encoding="utf-8").strip())
+            if now - last < timedelta(minutes=throttle_minutes):
+                return f"throttled (last {last:%H:%M})"
+    except (ValueError, OSError):
+        pass
+    creds = config.discord_settings()
+    token = creds["token"]
+    channel = creds["holdings_channel"] or creds["picks_channel"]
+    if not token or not channel:
+        return "unconfigured"
+    payload = {"embeds": [{
+        "title": ":warning: Fyers login missing — paper book FROZEN",
+        "description": (
+            "Today's Fyers token is stale, so this run booked **no** trades and "
+            "marked nothing (signals were still scanned/alerted).\n\n**Action:** "
+            "run the daily Fyers login. One login covers all 3 bots. Deadline: "
+            "**before 08:45** (earliest fleet run)."),
+        "color": ORANGE,
+    }]}
+    if not _post(token, channel, payload, warnings):
+        return "failed"
+    try:
+        _LOGIN_REMINDER_STATE.write_text(now.isoformat(timespec="seconds"),
+                                         encoding="utf-8")
+    except OSError:
+        pass
+    return "sent"
 
 
 def _chunk_embeds(embeds: list[dict]) -> list[list[dict]]:
