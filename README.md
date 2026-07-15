@@ -110,6 +110,22 @@ Requires the [Claude Code CLI](https://claude.com/claude-code) on PATH for senti
 `run_stockbot.ps1` is the Windows Task Scheduler entrypoint (schedule: 08:45 + 18:30
 daily with missed-run catch-up; logs to `data/logs/`).
 
+## Fyers login reminder — SHARED with mcxbot (cross-repo contract)
+
+When a run finds no fresh Fyers token, it posts an hourly-throttled Discord nudge
+to log in (`discord_alerts.send_login_reminder`). **stockbot and mcxbot share one
+Fyers token** (`FYERS_TOKEN_PATH`, default `C:/Users/srava/.fyers/fyers_token.json`),
+so they deliberately **share one throttle file** next to that token:
+`<FYERS_TOKEN_PATH dir>/.fyers_login_reminder_sent`. Whichever bot notices first
+pings; the other stays quiet for the hour — so a single stale token yields **one**
+nudge, not two.
+
+⚠️ **Do not change the throttle path/filename in only one repo.** Both
+`stockbot/discord_alerts._login_reminder_state()` and mcxbot's equivalent must
+resolve to the *same* file, or the shared throttle silently splits back into two
+and the double-ping returns. `stocks-intraday` is **not** part of this — it uses a
+separate token/login (`python -m bot.fyers_auth`) and its own throttle.
+
 ## Storage
 
 SQLite at `data/stockbot.db`: `picks` (tracked suggestions + exit history), `holdings`,

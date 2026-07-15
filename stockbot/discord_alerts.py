@@ -56,22 +56,41 @@ def _post(token: str, channel_id: str, payload: dict, warnings: list[str]) -> bo
         return False
 
 
-_LOGIN_REMINDER_STATE = config.DATA_DIR / ".login_reminder_sent"
+def _login_reminder_state():
+    """Path to the login-reminder throttle state file.
+
+    ┌─ SHARED CROSS-REPO CONTRACT — read before editing ─────────────────────┐
+    │ stockbot and mcxbot (mcx-short-term) share ONE Fyers token via          │
+    │ FYERS_TOKEN_PATH, so they must ALSO share ONE 60-min login-reminder      │
+    │ throttle — otherwise both fire their own nudge and you get two           │
+    │ near-simultaneous pings for a single stale token. That coordination is   │
+    │ this exact path: <FYERS_TOKEN_PATH dir>/.fyers_login_reminder_sent.      │
+    │ mcxbot's mcxbot/discord_alerts._login_reminder_state() MUST resolve to   │
+    │ the identical file. If you change the anchor or the filename here, change│
+    │ it there too, or the shared throttle silently splits back into two.      │
+    │ (stocks-intraday deliberately does NOT join this — it has its own token/ │
+    │  login and its own throttle in bot/alerts.py.)                           │
+    └─────────────────────────────────────────────────────────────────────────┘
+    Falls back to this bot's data dir when FYERS_TOKEN_PATH is unset."""
+    from stockbot.fyers_data import token_cache_path
+    return token_cache_path().parent / ".fyers_login_reminder_sent"
 
 
 def send_login_reminder(warnings: list[str], throttle_minutes: int = 60) -> str:
     """Hourly-throttled "Fyers login missing" nudge, sent when a run finds the
     paper book FROZEN (no fresh Fyers token, so paper.books_on_provider() is
     False and nothing books). Posts to the HOLDINGS channel if set, else PICKS.
-    Throttled to one post per `throttle_minutes` (via a small state file in this
-    bot's data dir) so the 30-min scans don't spam. Returns a short status
-    string (sent / throttled / unconfigured / failed)."""
+    Throttled to one post per `throttle_minutes` via a state file next to the
+    SHARED Fyers token, so the throttle spans every bot on that one login (and
+    the 30-min scans don't spam). Returns a short status string
+    (sent / throttled / unconfigured / failed)."""
     from datetime import datetime, timedelta
     now = datetime.now()
+    state = _login_reminder_state()
     try:
-        if _LOGIN_REMINDER_STATE.exists():
+        if state.exists():
             last = datetime.fromisoformat(
-                _LOGIN_REMINDER_STATE.read_text(encoding="utf-8").strip())
+                state.read_text(encoding="utf-8").strip())
             if now - last < timedelta(minutes=throttle_minutes):
                 return f"throttled (last {last:%H:%M})"
     except (ValueError, OSError):
@@ -93,8 +112,7 @@ def send_login_reminder(warnings: list[str], throttle_minutes: int = 60) -> str:
     if not _post(token, channel, payload, warnings):
         return "failed"
     try:
-        _LOGIN_REMINDER_STATE.write_text(now.isoformat(timespec="seconds"),
-                                         encoding="utf-8")
+        state.write_text(now.isoformat(timespec="seconds"), encoding="utf-8")
     except OSError:
         pass
     return "sent"

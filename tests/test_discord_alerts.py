@@ -62,7 +62,7 @@ def test_login_reminder_sends_and_records(monkeypatch, tmp_path):
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
     monkeypatch.setenv("DISCORD_HOLDINGS_CHANNEL_ID", "chan")
     state = tmp_path / ".login_reminder_sent"
-    monkeypatch.setattr(da, "_LOGIN_REMINDER_STATE", state)
+    monkeypatch.setattr(da, "_login_reminder_state", lambda: state)
     captured = {}
 
     def fake_post(token, channel, payload, warnings):
@@ -81,7 +81,8 @@ def test_login_reminder_falls_back_to_picks_channel(monkeypatch, tmp_path):
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
     monkeypatch.delenv("DISCORD_HOLDINGS_CHANNEL_ID", raising=False)
     monkeypatch.setenv("DISCORD_PICKS_CHANNEL_ID", "picks")
-    monkeypatch.setattr(da, "_LOGIN_REMINDER_STATE", tmp_path / ".login_reminder_sent")
+    monkeypatch.setattr(da, "_login_reminder_state",
+                        lambda: tmp_path / ".login_reminder_sent")
     captured = {}
     monkeypatch.setattr(da, "_post",
                         lambda t, c, p, w: captured.setdefault("channel", c) or True)
@@ -95,7 +96,7 @@ def test_login_reminder_throttled_within_the_hour(monkeypatch, tmp_path):
     monkeypatch.setenv("DISCORD_HOLDINGS_CHANNEL_ID", "chan")
     state = tmp_path / ".login_reminder_sent"
     state.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
-    monkeypatch.setattr(da, "_LOGIN_REMINDER_STATE", state)
+    monkeypatch.setattr(da, "_login_reminder_state", lambda: state)
 
     def must_not_post(*a, **k):
         raise AssertionError("throttled reminder must not post")
@@ -108,5 +109,5 @@ def test_login_reminder_unconfigured(monkeypatch, tmp_path):
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     monkeypatch.delenv("DISCORD_HOLDINGS_CHANNEL_ID", raising=False)
     monkeypatch.delenv("DISCORD_PICKS_CHANNEL_ID", raising=False)
-    monkeypatch.setattr(da, "_LOGIN_REMINDER_STATE", tmp_path / ".none")
+    monkeypatch.setattr(da, "_login_reminder_state", lambda: tmp_path / ".none")
     assert da.send_login_reminder([]) == "unconfigured"
