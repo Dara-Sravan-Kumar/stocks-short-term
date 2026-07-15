@@ -138,6 +138,8 @@ def _evaluate_exits(book: _Book, date: str,
             book.close(ticker, date, pos["stop"], "STOPPED_OUT", "hit stop")
         elif s.high >= pos["target"]:
             book.close(ticker, date, pos["target"], "TARGET_HIT", "hit target")
+        elif pos["bars_held"] < config.MIN_HOLD_BEFORE_SOFT_EXIT:
+            continue  # grace period — soft exits can't fire on pre-existing state
         elif s.closes_below_sma20 >= sma_bars:
             book.close(ticker, date, s.close, "SETUP_BROKEN",
                        f"{s.closes_below_sma20} closes below SMA20")
@@ -161,7 +163,8 @@ def _evaluate_entries(book: _Book, date: str, snapshots: dict[str, Snapshot],
         if not gate_fn(s, params, context):
             continue
         target, stop = derive_target_stop(s, config.MIN_UPSIDE_PCT,
-                                          config.MAX_RISK_PCT)
+                                          config.MAX_RISK_PCT,
+                                          config.MIN_STOP_ATR_MULT)
         if target is None:
             continue
         upside = (target - s.close) / s.close * 100

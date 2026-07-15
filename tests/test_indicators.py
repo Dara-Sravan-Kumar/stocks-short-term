@@ -7,7 +7,8 @@ import pandas as pd
 import pytest
 
 from stockbot.indicators import (
-    anchored_vwap, chaikin_money_flow, compute_snapshot, find_bullish_fvg, volume_poc,
+    Snapshot, anchored_vwap, atr_wilder, chaikin_money_flow, compute_snapshot,
+    derive_target_stop, find_bullish_fvg, volume_poc,
 )
 
 
@@ -161,5 +162,57 @@ def test_compute_snapshot_populates_all_new_fields_sanely():
     assert snap.volume_poc > 0
     assert snap.high_252d >= snap.close or snap.high_252d >= snap.high
     assert snap.close_prev > 0
+    assert snap.atr > 0  # Wilder ATR(14) populated with plenty of history
     if snap.fvg_bull_bottom is not None:
         assert snap.fvg_bull_bottom < snap.fvg_bull_top
+
+
+# ---------------------------------------------------------------------------
+# ATR(14) and the ATR-based minimum stop distance
+# ---------------------------------------------------------------------------
+
+def test_atr_wilder_equals_range_on_constant_range_bars():
+    # every bar spans exactly 4.0 with no gaps -> True Range == 4.0 -> ATR == 4.0
+    n = 40
+    close = pd.Series([100.0] * n)
+    high = pd.Series([102.0] * n)
+    low = pd.Series([98.0] * n)
+    atr = atr_wilder(high, low, close, period=14)
+    assert atr.iloc[-1] == pytest.approx(4.0)
+
+
+def _stop_snap(**over) -> Snapshot:
+    """Snapshot with a support pivot right under a 100.0 close (a noise-tight
+    0.5% stop) — the case the ATR floor exists to widen."""
+    base = dict(
+        ticker="X.NS", date="2026-07-06", close=100.0, high=101.0, low=99.5,
+        rsi=55.0, macd=0.1, macd_signal=0.0, macd_hist=0.1, macd_hist_prev=0.0,
+        macd_bullish_cross_recent=False, macd_bearish_cross_today=False,
+        sma20=99.0, sma50=95.0, closes_below_sma20=0, mom_5d=1.0, mom_20d=5.0,
+        vol_ratio=1.0, avg_turnover_20d=500e6, swing_low_10d=99.5,
+        swing_low_10d_prior=99.5, close_prev=99.8, cmf=0.1, cmf_prev=0.05,
+        fvg_bull_bottom=None, fvg_bull_top=None, anchored_vwap=98.0,
+        volume_poc=98.0, high_252d=110.0, pivot=100.0, r1=103.0, r2=105.0,
+        s1=99.5, s2=97.0, r3=107.0, weekly_r1=104.0, weekly_r2=106.0, weekly_r3=108.0,
+    )
+    base.update(over)
+    return Snapshot(**base)
+
+
+def test_stop_floor_widens_a_noise_tight_stop_to_atr_multiple():
+    snap = _stop_snap(atr=3.0)  # 3% ATR; support stop is only 0.5% away
+    _, stop = derive_target_stop(snap, 2.0, 5.0, min_stop_atr_mult=1.5)
+    # widened to 1.5 x 3% = 4.5% below entry
+    assert stop == pytest.approx(95.5)
+
+
+def test_stop_floor_never_exceeds_max_risk_ceiling():
+    snap = _stop_snap(atr=10.0)  # 1.5 x 10% = 15% would blow past the 5% cap
+    _, stop = derive_target_stop(snap, 2.0, 5.0, min_stop_atr_mult=1.5)
+    assert stop == pytest.approx(95.0)  # clamped to max_risk_pct = 5%
+
+
+def test_stop_floor_noop_without_atr_or_multiplier():
+    # atr unknown (0) or feature off (mult 0) -> original support stop preserved
+    assert derive_target_stop(_stop_snap(atr=0.0), 2.0, 5.0, 1.5)[1] == pytest.approx(99.5)
+    assert derive_target_stop(_stop_snap(atr=3.0), 2.0, 5.0, 0.0)[1] == pytest.approx(99.5)

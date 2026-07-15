@@ -137,15 +137,67 @@ def register_spec(conn, spec: StrategySpec, histories: dict, warnings: list[str]
 # Phase 3 — the discoverer: propose published SWING strategies as specs, then
 # push each through register_spec (validate + backtest gate).
 # --------------------------------------------------------------------------- #
-def _build_discovery_prompt(existing_exprs: list[str], n: int) -> str:
+def _performance_digest(conn) -> str:
+    """A compact read of how the live fleet is ACTUALLY doing, so the discoverer
+    proposes into gaps rather than blind. Best/worst tested variants by profit
+    factor + overall closed-trade win rate."""
+    stats = db.get_strategy_ledger_stats(conn)
+    tested = [(k, s) for k, s in stats.items() if s.get("closed")]
+    if not tested:
+        return "  (no closed trades on the live book yet)"
+
+    def _pf(item):
+        pf = item[1].get("profit_factor")
+        return pf if pf is not None else float("inf")
+
+    ranked = sorted(tested, key=_pf, reverse=True)
+    total_closed = sum(s["closed"] for _, s in tested)
+    wins = sum(s["closed"] * (s["win_rate"] / 100.0) for _, s in tested)
+    overall_wr = (wins / total_closed * 100.0) if total_closed else 0.0
+
+    def _line(k, s):
+        pf = s.get("profit_factor")
+        pf_s = "inf" if pf is None else f"{pf:.2f}"
+        return (f"    {k}: {s['closed']} trades, win {s['win_rate']:.0f}%, "
+                f"pnl {s['realized_pnl']:.0f}, PF {pf_s}")
+
+    lines = [f"  Overall: {total_closed} closed trades, {overall_wr:.0f}% win rate.",
+             "  Best variants:"]
+    lines += [_line(k, s) for k, s in ranked[:3]]
+    lines.append("  Worst variants:")
+    lines += [_line(k, s) for k, s in ranked[-3:]]
+    return "\n".join(lines)
+
+
+def _build_discovery_prompt(existing_exprs: list[str], n: int,
+                            performance: str | None = None,
+                            lessons: list[str] | None = None,
+                            web: bool = False) -> str:
     glossary = "\n".join(f"  {k}: {v}" for k, v in FIELD_GLOSSARY.items())
     existing = "\n".join(f"  - {e}" for e in existing_exprs) or "  (none yet)"
-    return (
+    source = (
+        "SEARCH THE WEB for short-term SWING trading strategies currently "
+        "discussed by traders/quants for NSE India / global equities (recent "
+        "articles, blogs, papers), then translate the most promising DAILY-bar "
+        "ones into specs."
+        if web else
+        "Draw on well-documented strategies — momentum breakouts, moving-average "
+        "pullbacks, mean-reversion, order-flow/volume setups, 52-week-high "
+        "leadership, etc."
+    )
+    parts = [
         "You are a quantitative researcher curating PUBLISHED short-term SWING "
         "trading strategies (holding ~2-20 trading days on DAILY bars) for an NSE "
-        "India paper-trading bot. Draw on well-documented strategies — momentum "
-        "breakouts, moving-average pullbacks, mean-reversion, order-flow/volume "
-        "setups, 52-week-high leadership, etc.\n\n"
+        "India paper-trading bot. " + source + "\n",
+    ]
+    if performance:
+        parts.append("How this bot's live fleet is ACTUALLY performing:\n"
+                     + performance + "\n")
+    if lessons:
+        parts.append("Lessons from a post-mortem of this book's own recent closed "
+                     "trades — bias your proposals to ADDRESS these:\n"
+                     + "\n".join(f"  - {x}" for x in lessons) + "\n")
+    parts.append(
         "Express each strategy's ENTRY as a boolean expression over ONLY these "
         "fields the bot computes per stock per day:\n" + glossary + "\n\n"
         "HARD RULES (violations are discarded):\n"
@@ -160,6 +212,7 @@ def _build_discovery_prompt(existing_exprs: list[str], n: int) -> str:
         '"entry_expr": "<expression>", "min_reward_risk": <number 1.2-3.0>, '
         '"rationale": "<one sentence naming the published strategy>"}]}'
     )
+    return "\n".join(parts)
 
 
 def _clamp_rr(value) -> float:
@@ -180,9 +233,14 @@ def _safe_name(raw, conn, prefix: str = "disc") -> str:
 
 
 def discover_and_register(conn, histories: dict, warnings: list[str],
-                          max_candidates: int = 6, use_llm: bool = True) -> dict:
+                          max_candidates: int = 6, use_llm: bool = True,
+                          lessons: list[str] | None = None) -> dict:
     """Ask the LLM for published SWING strategies, translate to specs, and push
-    each through the backtest gate. Returns {"proposed", "registered", "rejected"}."""
+    each through the backtest gate. Returns {"proposed", "registered", "rejected"}.
+
+    When config.STRATEGY_WEB_DISCOVERY is on, the model reads live web results;
+    `lessons` (from the trade post-mortem) and the live performance digest are
+    fed in so proposals answer what's actually failing on this book."""
     report = {"proposed": 0, "registered": [], "rejected": []}
     if not use_llm:
         return report
@@ -190,8 +248,14 @@ def discover_and_register(conn, histories: dict, warnings: list[str],
     existing = [json.loads(r["params_json"]).get("entry_expr", "")
                 for r in db.get_active_strategies(conn, channel="DISCOVERED")
                 if r["params_json"]]
+    web = config.STRATEGY_WEB_DISCOVERY
+    prompt = _build_discovery_prompt(existing, max_candidates,
+                                     performance=_performance_digest(conn),
+                                     lessons=lessons, web=web)
     parsed = strategy_engine._call_claude_cli(
-        _build_discovery_prompt(existing, max_candidates), warnings)
+        prompt, warnings,
+        allowed_tools=["WebSearch"] if web else None,
+        timeout=config.STRATEGY_WEB_DISCOVERY_TIMEOUT if web else None)
     candidates = parsed.get("strategies") if isinstance(parsed, dict) else None
     if not isinstance(candidates, list):
         warnings.append("strategy discovery: no usable proposals from Claude CLI")

@@ -330,7 +330,8 @@ def _gather_candidates(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
         if not gate_fn(s, params, context):
             continue
 
-        target, stop = derive_target_stop(s, config.MIN_UPSIDE_PCT, config.MAX_RISK_PCT)
+        target, stop = derive_target_stop(s, config.MIN_UPSIDE_PCT, config.MAX_RISK_PCT,
+                                          config.MIN_STOP_ATR_MULT)
         if target is None:
             continue  # no resistance rung offers enough upside
         upside = (target - s.close) / s.close * 100
@@ -434,7 +435,8 @@ def scan_news_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapshot],
         if s.close <= s.sma20 or s.rsi > config.NEWS_RSI_MAX:
             continue
 
-        target, stop = derive_target_stop(s, config.MIN_UPSIDE_PCT, config.MAX_RISK_PCT)
+        target, stop = derive_target_stop(s, config.MIN_UPSIDE_PCT, config.MAX_RISK_PCT,
+                                          config.MIN_STOP_ATR_MULT)
         if target is None:
             continue
         upside = (target - s.close) / s.close * 100

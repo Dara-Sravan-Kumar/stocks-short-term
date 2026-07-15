@@ -148,6 +148,13 @@ MACD_CROSS_LOOKBACK = 3        # bullish crossover within N bars counts
 MIN_UPSIDE_PCT = 2.0           # target must be >= 2% above entry
 MIN_REWARD_RISK = 1.5
 MAX_RISK_PCT = 5.0             # stop clamped to at most 5% below entry
+# Minimum stop distance as a multiple of ATR(14). A support pivot sitting just
+# under price gives a sub-1% stop that normal daily noise tags on day 1 (the
+# post-mortem's #1 loss driver). Floor the stop at MIN_STOP_ATR_MULT x ATR so it
+# sits outside routine volatility — clamped to MAX_RISK_PCT so it never widens
+# risk past the ceiling (a stock too volatile to stop within the cap simply
+# yields a worse R:R and gets filtered by the reward:risk gate).
+MIN_STOP_ATR_MULT = 1.5
 SENTIMENT_ENTRY_MIN = -0.2     # sentiment must be above this to allow entry
 MAX_NEW_PICKS_PER_DAY = None   # None = uncapped; capital efficiency (strategy_engine
                                # capital weights + paper.py cash/risk sizing) is the
@@ -174,6 +181,13 @@ SETUP_BROKEN_SMA_BARS = 2      # closes below SMA20 for N consecutive bars
 SETUP_BROKEN_RSI = 45.0        # with MACD bearish cross
 SENTIMENT_EXIT_MAX = -0.5      # sentiment at/below this breaks the setup
 MAX_HOLDING_DAYS = 10          # trading days before EXPIRED
+# The "setup broken" exits (SMA20-streak / MACD / sentiment) read the stock's
+# ABSOLUTE state, which for a dip-buy/mean-reversion entry is often ALREADY
+# "broken" at entry (e.g. price sitting below SMA20). Without a grace period they
+# guillotine fresh positions on day 1 citing a streak that predates the trade —
+# the root cause of near-every trade closing in 1 bar. Hold soft exits until the
+# thesis has had this many trading bars; hard stop/target still fire any day.
+MIN_HOLD_BEFORE_SOFT_EXIT = 2  # trading days before SETUP_BROKEN exits are eligible
 
 # ---------------------------------------------------------------------------
 # Fundamental quality gate (market-cap floor is tier-aware)
@@ -382,6 +396,20 @@ STRATEGY_FLEET_MAX_BY_CHANNEL = {
 MAX_DISCOVERED_PICKS_PER_DAY = None
 DISCOVERED_FLEET_MAX = 12               # cap live discovered variants (bounds fleet growth)
 
+# --- Reflective R&D (evening run) -----------------------------------------
+# The web discoverer can pull CURRENTLY-published swing setups off the internet
+# (Claude CLI WebSearch) instead of relying only on the model's training memory.
+# Best-effort: if the tool is unavailable it silently falls back to model
+# knowledge, so this never breaks the run.
+STRATEGY_WEB_DISCOVERY = True           # let discovery search the web for published setups
+STRATEGY_WEB_DISCOVERY_TIMEOUT = 600    # seconds (web search + reasoning is slower than a plain call)
+# Trade post-mortem: before discovery, an LLM diagnoses WHY recent closed paper
+# trades won/lost and hands those lessons to the discoverer so new specs answer
+# what actually went wrong on THIS book.
+POSTMORTEM_ENABLED = True
+POSTMORTEM_LOOKBACK_TRADES = 40         # most-recent closed paper positions to review
+POSTMORTEM_MIN_TRADES = 6               # below this there's too little signal to diagnose
+
 # Backtest gate — a spec must clear this on OUT-OF-SAMPLE history before it can
 # enter the live fleet. This is the overfitting defense: proposals are cheap,
 # so the bar to go live is deliberately real.
@@ -524,4 +552,7 @@ def discord_settings() -> dict:
         "holdings_channel": os.getenv("DISCORD_HOLDINGS_CHANNEL_ID", "").strip(),
         "paper_channel": os.getenv("DISCORD_PAPER_CHANNEL_ID", "").strip(),
         "strategy_channel": os.getenv("DISCORD_STRATEGY_CHANNEL_ID", "").strip(),
+        # Health/failure pings (news outage, LLM fallback, Fyers login missing).
+        # Falls back to holdings → picks channel when unset.
+        "alerts_channel": os.getenv("DISCORD_ALERTS_CHANNEL_ID", "").strip(),
     }

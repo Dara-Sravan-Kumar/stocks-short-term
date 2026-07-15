@@ -58,6 +58,7 @@ class Snapshot:
     weekly_r1: float
     weekly_r2: float
     weekly_r3: float
+    atr: float = 0.0                 # Wilder ATR(14), absolute price units (0 if unknown)
 
 
 def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
@@ -77,6 +78,18 @@ def macd_lines(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
     macd = ema_fast - ema_slow
     sig = macd.ewm(span=signal, adjust=False).mean()
     return macd, sig, macd - sig
+
+
+def atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series,
+               period: int = 14) -> pd.Series:
+    """Average True Range (Wilder). True Range = max of the current high-low
+    range and the gaps to the prior close, smoothed with Wilder's EMA. Absolute
+    price units — a volatility yardstick for sizing stops outside daily noise."""
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
 
 def classic_pivots(h: float, l: float, c: float) -> dict[str, float]:
@@ -195,6 +208,10 @@ def compute_snapshot(ticker: str, df: pd.DataFrame, cross_lookback: int = 3) -> 
 
     cmf_series = chaikin_money_flow(close, high, low, vol)
     fvg_bottom, fvg_top = find_bullish_fvg(high, low)
+    atr_series = atr_wilder(high, low, close)
+    atr_val = float(atr_series.iloc[-1])
+    if atr_val != atr_val:  # NaN (too little history) -> unknown
+        atr_val = 0.0
 
     return Snapshot(
         ticker=ticker,
@@ -230,11 +247,13 @@ def compute_snapshot(ticker: str, df: pd.DataFrame, cross_lookback: int = 3) -> 
         weekly_r1=weekly_r1,
         weekly_r2=weekly_r2,
         weekly_r3=weekly_r3,
+        atr=atr_val,
     )
 
 
 def derive_target_stop(snap: Snapshot, min_upside_pct: float,
-                       max_risk_pct: float) -> tuple[float | None, float]:
+                       max_risk_pct: float,
+                       min_stop_atr_mult: float = 0.0) -> tuple[float | None, float]:
     """Target = the nearest resistance rung offering at least min upside.
 
     The ladder combines daily R1/R2/R3 and weekly R1/R2/R3 — so a stock that
@@ -259,4 +278,15 @@ def derive_target_stop(snap: Snapshot, min_upside_pct: float,
     risk_pct = (entry - stop) / entry * 100
     if risk_pct > max_risk_pct:
         stop = entry * (1 - max_risk_pct / 100)
+        risk_pct = max_risk_pct
+    # Floor the stop OUTSIDE routine daily noise: a support pivot right under
+    # price otherwise gives a sub-1% stop that gets tagged on day 1. Widen to
+    # MIN_STOP_ATR_MULT x ATR, but never past the max-risk ceiling — a stock too
+    # volatile to stop within the cap just ends with a worse R:R and is filtered
+    # by the reward:risk gate rather than kept on a noise-tight stop.
+    atr_pct = (snap.atr / entry * 100) if entry > 0 else 0.0
+    if atr_pct > 0 and min_stop_atr_mult > 0:
+        min_stop_pct = min(min_stop_atr_mult * atr_pct, max_risk_pct)
+        if risk_pct < min_stop_pct:
+            stop = entry * (1 - min_stop_pct / 100)
     return (float(target) if target is not None else None), float(stop)

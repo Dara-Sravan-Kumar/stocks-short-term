@@ -142,6 +142,11 @@ def main() -> int:
              or _passes_pullback(snapshots[t], _pullback_defaults))
     ]
 
+    # Health signals for the Discord failure alert (populated only on full runs;
+    # the 30-min --skip-news scans neither fetch news nor call the LLM, so they
+    # stay quiet by construction — failures ping on the scheduled AM/PM runs).
+    news_failure: str | None = None
+    llm_failure: str | None = None
     if args.skip_news:
         # Hourly in-between run: no news fetch, no fresh LLM calls. Still look
         # up whatever's cached from this AM/PM slot's real news run for the
@@ -163,6 +168,15 @@ def main() -> int:
         headlines = news.fetch_headlines_bulk(news_universe, warnings)
 
         with_news = [t for t, hl in headlines.items() if hl]
+        # A total blackout (asked many liquid names, got zero headlines from BOTH
+        # Yahoo Finance and Google News RSS) means the news sources are down —
+        # sentiment then scores on empty inputs. Partial gaps are normal and don't
+        # alert; only a full outage does.
+        if len(news_universe) >= 5 and not with_news:
+            news_failure = (f"News blackout: 0 of {len(news_universe)} liquid tickers "
+                            "returned any headline (Yahoo Finance + Google News RSS "
+                            "both empty). Sentiment ran on empty inputs this run.")
+            print(f"  WARNING: {news_failure}")
         sentiment_universe = sorted(set(with_news) | set(screen_survivors)
                                     | set(active) | set(held))
         headlines = {t: headlines.get(t, []) for t in sentiment_universe}
@@ -183,6 +197,13 @@ def main() -> int:
         llm_status = f"Claude CLI ({config.SENTIMENT_MODEL})"
     else:
         llm_status = "neutral (--no-llm)" if not use_llm else "cached"
+    # LLM outright failed if every ticker fell back to neutral on a run that
+    # meant to score with the CLI (claude missing / all calls errored/timed out).
+    if use_llm and llm_status == "FALLBACK (neutral)":
+        llm_failure = ("LLM sentiment fell back to NEUTRAL for every ticker — the "
+                       "Claude CLI is missing on PATH or every call failed/timed out. "
+                       "Picks were scored on neutral sentiment this run.")
+        print(f"  WARNING: {llm_failure}")
 
     # ------------------------------------------------------------- exit logic
     print("Evaluating active picks for exit signals...")
@@ -332,6 +353,18 @@ def main() -> int:
         )
 
     # --------------------------------------------------------------- discord
+    # Health/failure ping first — news outage or LLM fallback on a scheduled full
+    # run gets its own red alert (login failures are pinged separately, hourly,
+    # up at the book-frozen check). Independent of the picks/activity gate below.
+    failures = []
+    if news_failure:
+        failures.append({"kind": "News fetch", "detail": news_failure})
+    if llm_failure:
+        failures.append({"kind": "LLM sentiment", "detail": llm_failure})
+    if failures and not args.no_discord:
+        fstatus = discord_alerts.send_failure_alert(run_date, run_slot, failures, warnings)
+        print(f"Failure alert: {fstatus}")
+
     has_activity = discord_alerts.has_reportable_activity(
         closed, new_picks, paper_entries, paper_exits, strategy_ledger["events"])
     if args.no_discord:
@@ -372,9 +405,15 @@ def main() -> int:
     # are live for the next morning's run.
     if run_slot == "PM" and not args.skip_news and use_llm and book_live:
         try:
-            from stockbot import strategy_discovery, strategy_mixer
-            print("Running daily strategy discovery + mixing (Fyers data)...")
-            disc = strategy_discovery.discover_and_register(conn, histories, warnings)
+            from stockbot import postmortem, strategy_discovery, strategy_mixer
+            print("Running daily trade post-mortem + strategy discovery + mixing (Fyers data)...")
+            pm = postmortem.analyze_recent_trades(conn, warnings)
+            if pm["lessons"]:
+                print(f"  Post-mortem ({pm['reviewed']} trades): {pm['diagnosis']}")
+                for lesson in pm["lessons"]:
+                    print(f"    - {lesson}")
+            disc = strategy_discovery.discover_and_register(
+                conn, histories, warnings, lessons=pm["lessons"])
             mix = strategy_mixer.mix_and_register(conn, histories, warnings)
             print(f"  Discovery: {len(disc['registered'])}/{disc['proposed']} registered; "
                   f"Mixer: {len(mix['registered'])}/{mix['proposed']} registered")

@@ -78,7 +78,7 @@ def send_login_reminder(warnings: list[str], throttle_minutes: int = 60) -> str:
         pass
     creds = config.discord_settings()
     token = creds["token"]
-    channel = creds["holdings_channel"] or creds["picks_channel"]
+    channel = creds["alerts_channel"] or creds["holdings_channel"] or creds["picks_channel"]
     if not token or not channel:
         return "unconfigured"
     payload = {"embeds": [{
@@ -98,6 +98,34 @@ def send_login_reminder(warnings: list[str], throttle_minutes: int = 60) -> str:
     except OSError:
         pass
     return "sent"
+
+
+def send_failure_alert(run_date: str, run_slot: str, failures: list[dict],
+                       warnings: list[str]) -> str:
+    """Post a red health-alert embed for pipeline failures (news outage, LLM
+    fallback, …). `failures` is a list of {"kind", "detail"}. Posts to the
+    alerts channel (falls back to holdings → picks). No-op on empty failures or
+    when Discord is unconfigured. Returns a short status string.
+
+    News/LLM run only on the scheduled AM/PM anchor runs, so callers pass a
+    non-empty list only there — the 30-min scans stay quiet by construction."""
+    if not failures:
+        return "no failures"
+    creds = config.discord_settings()
+    token = creds["token"]
+    channel = creds["alerts_channel"] or creds["holdings_channel"] or creds["picks_channel"]
+    if not token or not channel:
+        return "unconfigured"
+    fields = [{"name": f":x: {f['kind']}", "value": _clip(str(f["detail"]), 1000),
+               "inline": False} for f in failures]
+    payload = {"embeds": [{
+        "title": f":rotating_light: PIPELINE FAILURE — {run_date} ({run_slot})",
+        "description": ("One or more data/LLM steps failed this run. Picks/scoring "
+                        "may be degraded — see below."),
+        "color": RED,
+        "fields": fields[:25],
+    }]}
+    return "sent" if _post(token, channel, payload, warnings) else "failed"
 
 
 def _chunk_embeds(embeds: list[dict]) -> list[list[dict]]:

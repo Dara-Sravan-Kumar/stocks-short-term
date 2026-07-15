@@ -229,4 +229,4 @@ def spec_target_stop(spec: StrategySpec, snap: Snapshot) -> tuple[float | None, 
     import config
     min_up = spec.min_upside_pct if spec.min_upside_pct is not None else config.MIN_UPSIDE_PCT
     max_risk = spec.max_risk_pct if spec.max_risk_pct is not None else config.MAX_RISK_PCT
-    return derive_target_stop(snap, min_up, max_risk)
+    return derive_target_stop(snap, min_up, max_risk, config.MIN_STOP_ATR_MULT)

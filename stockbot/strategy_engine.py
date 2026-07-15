@@ -164,26 +164,37 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
-def _call_claude_cli(prompt: str, warnings: list[str], attempts: int = 2) -> dict | None:
+def _call_claude_cli(prompt: str, warnings: list[str], attempts: int = 2,
+                     allowed_tools: list[str] | None = None,
+                     timeout: int | None = None) -> dict | None:
     """One `claude -p` invocation with retry, mirroring sentiment.py's pattern
     (same CLI, subscription-billed, tolerant JSON parsing) but expecting a
-    single JSON object rather than an array."""
+    single JSON object rather than an array.
+
+    allowed_tools whitelists Claude Code tools for this call (e.g. ["WebSearch"]
+    so the discoverer can read live web results); in headless -p mode a tool not
+    on this list is auto-denied, never prompted. timeout overrides the default
+    for slower tool-using calls."""
     exe = shutil.which("claude")
     if not exe:
         warnings.append("Claude CLI ('claude') not found on PATH - strategy proposal uses fallback")
         return None
 
+    argv = [exe, "-p", "--output-format", "json", "--model", config.STRATEGY_LLM_MODEL]
+    if allowed_tools:
+        argv += ["--allowedTools", ",".join(allowed_tools)]
+
     last_error = ""
     for attempt in range(1, attempts + 1):
         try:
             proc = subprocess.run(
-                [exe, "-p", "--output-format", "json", "--model", config.STRATEGY_LLM_MODEL],
+                argv,
                 input=prompt,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=config.CLAUDE_CLI_TIMEOUT,
+                timeout=timeout or config.CLAUDE_CLI_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
             last_error = f"timed out after {config.CLAUDE_CLI_TIMEOUT}s"

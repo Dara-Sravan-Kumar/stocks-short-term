@@ -41,6 +41,9 @@ def evaluate_active_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapsho
             continue  # suggested today; evaluate from tomorrow
 
         status = exit_price = reason = None
+        hist = histories.get(ticker)
+        days_held = (_trading_days_held(pick["entry_date"], snap, hist.index)
+                     if hist is not None else 0)
 
         if snap.low <= pick["stop_price"]:
             status = "STOPPED_OUT"
@@ -50,7 +53,11 @@ def evaluate_active_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapsho
             status = "TARGET_HIT"
             exit_price = pick["target_price"]
             reason = "Target resistance reached - book profit"
-        else:
+        elif days_held >= config.MIN_HOLD_BEFORE_SOFT_EXIT:
+            # Soft "setup broken" exits read the stock's ABSOLUTE state, which is
+            # often already broken at entry (dip-buys sit below SMA20). The grace
+            # period above stops them firing on day 1 on a streak that predates
+            # the trade; hard stop/target above are unguarded and fire any day.
             sent = (sentiments.get(ticker) or {}).get("score", 0.0) or 0.0
             # pullback entries sit AT SMA20, so they get more room before the
             # consecutive-closes-below rule fires
@@ -74,14 +81,11 @@ def evaluate_active_picks(conn: sqlite3.Connection, snapshots: dict[str, Snapsho
                 status = "SETUP_BROKEN"
                 exit_price = snap.close
                 reason = f"News sentiment breakdown ({sent:+.2f})"
-            else:
-                hist = histories.get(ticker)
-                days = _trading_days_held(pick["entry_date"], snap, hist.index) if hist is not None else 0
-                if days > config.MAX_HOLDING_DAYS:
-                    status = "EXPIRED"
-                    exit_price = snap.close
-                    reason = (f"Max holding period ({config.MAX_HOLDING_DAYS} trading days) "
-                              "- no longer required")
+            elif days_held > config.MAX_HOLDING_DAYS:
+                status = "EXPIRED"
+                exit_price = snap.close
+                reason = (f"Max holding period ({config.MAX_HOLDING_DAYS} trading days) "
+                          "- no longer required")
 
         if status:
             db.close_pick(conn, pick["id"], status, date, round(float(exit_price), 2), reason)
