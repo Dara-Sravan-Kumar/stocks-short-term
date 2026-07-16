@@ -149,9 +149,38 @@ def _fleet_snapshot(conn) -> None:
         f"{ch} {n}" for ch, n in by_channel.items()))
 
 
+def _fyers_connection() -> tuple[bool, str]:
+    """Read-only Fyers login status for the Summary banner. Mirrors EXACTLY the
+    condition fyers_data._ensure_token uses (token cached AND issued today AND
+    access_token present) — so this banner can never disagree with the book's
+    actual freeze behaviour. Pure display; reads the shared token file only."""
+    from datetime import datetime
+
+    from stockbot import fyers_data
+    cache = fyers_data.load_token_cache()
+    today = datetime.now().strftime("%Y-%m-%d")
+    if cache and cache.get("access_token") and cache.get("issued") == today:
+        return True, f"token issued {cache['issued']}"
+    if cache and cache.get("access_token"):
+        return False, f"stale — last login {cache.get('issued') or '?'}"
+    return False, "no token cached"
+
+
+def _fyers_banner() -> None:
+    ok, detail = _fyers_connection()
+    if ok:
+        st.success(f"🟢 **Connected to Fyers** — {detail}. Runs book on real "
+                   "market data.")
+    else:
+        st.error(f"🔴 **Not connected to Fyers** — {detail}. Run the daily Fyers "
+                 "login; the paper book stays frozen (fallback runs don't book) "
+                 "until you log in.")
+
+
 def render(conn) -> None:
     """Body of the Summary view (no title/conn management) — reused as a tab by
     dashboard_web.py's MCX-style 2-view layout."""
+    _fyers_banner()
     st.header("Book at a Glance")
     if common.mode() == "LIVE":
         _live_tiles(conn)
